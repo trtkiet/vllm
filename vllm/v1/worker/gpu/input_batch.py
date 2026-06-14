@@ -22,10 +22,19 @@ class InputBuffers:
 
         self.input_ids = torch.zeros(max_num_tokens, dtype=torch.int32, device=device)
         self.positions = torch.zeros(max_num_tokens, dtype=torch.int64, device=device)
+        self.kv_positions = torch.zeros(
+            max_num_tokens, dtype=torch.int64, device=device
+        )
         self.query_start_loc = torch.zeros(
             max_num_reqs + 1, dtype=torch.int32, device=device
         )
         self.seq_lens = torch.zeros(max_num_reqs, dtype=torch.int32, device=device)
+        self.logical_seq_lens = torch.zeros(
+            max_num_reqs, dtype=torch.int32, device=device
+        )
+        self.num_resident_tokens = torch.zeros(
+            max_num_reqs, dtype=torch.int32, device=device
+        )
         # DCP: per-request local seq_lens buffer
         self.dcp_local_seq_lens = torch.zeros(
             max_num_reqs, dtype=torch.int32, device=device
@@ -63,12 +72,16 @@ class InputBatch:
     query_start_loc_np: np.ndarray
     # [num_reqs]
     seq_lens: torch.Tensor
+    # [num_reqs]
+    logical_seq_lens: torch.Tensor
     # [num_reqs] CPU upper bound on seq_lens (see CommonAttentionMetadata).
     seq_lens_cpu_upper_bound: torch.Tensor
     # [num_reqs]
     dcp_local_seq_lens: torch.Tensor | None
     # [num_reqs]
     num_computed_tokens_np: np.ndarray
+    # [num_reqs]
+    num_resident_tokens_np: np.ndarray
     # [num_reqs]
     prefill_len_np: np.ndarray
     # [num_reqs]
@@ -83,6 +96,8 @@ class InputBatch:
     input_ids: torch.Tensor
     # [num_tokens_after_padding]
     positions: torch.Tensor
+    # [num_tokens_after_padding]
+    kv_positions: torch.Tensor
 
     # [total_num_logits]
     logits_indices: torch.Tensor
@@ -119,6 +134,8 @@ class InputBatch:
         # Pad for full CUDA graph mode.
         input_buffers.seq_lens[num_reqs:] = 0
         seq_lens = input_buffers.seq_lens[:num_reqs]
+        input_buffers.logical_seq_lens.copy_(input_buffers.seq_lens)
+        logical_seq_lens = input_buffers.logical_seq_lens[:num_reqs]
 
         query_start_loc_np = np.empty(num_reqs + 1, dtype=np.int32)
         query_start_loc_np[0] = 0
@@ -133,6 +150,7 @@ class InputBatch:
 
         input_ids = input_buffers.input_ids[:num_tokens].zero_()
         positions = input_buffers.positions[:num_tokens].zero_()
+        kv_positions = input_buffers.kv_positions[:num_tokens].zero_()
 
         logits_indices = query_start_loc[1:] - 1
         cu_num_logits = torch.arange(num_reqs + 1, device=device, dtype=torch.int32)
@@ -155,15 +173,18 @@ class InputBatch:
             query_start_loc=query_start_loc,
             query_start_loc_np=query_start_loc_np,
             seq_lens=seq_lens,
+            logical_seq_lens=logical_seq_lens,
             seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
             dcp_local_seq_lens=None,
             num_computed_tokens_np=np.zeros(num_reqs, dtype=np.int32),
+            num_resident_tokens_np=np.zeros(num_reqs, dtype=np.int32),
             prefill_len_np=np.zeros(num_reqs, dtype=np.int32),
             num_computed_prefill_tokens_np=np.zeros(num_reqs, dtype=np.int32),
             is_prefilling_np=np.zeros(num_reqs, dtype=np.bool_),
             max_seq_len_np=None,
             input_ids=input_ids,
             positions=positions,
+            kv_positions=kv_positions,
             logits_indices=logits_indices,
             cu_num_logits=cu_num_logits,
             cu_num_logits_np=cu_num_logits_np,
@@ -234,10 +255,13 @@ def prepare_prefill_inputs(
 @triton.jit
 def _prepare_pos_seq_lens_kernel(
     pos_ptr,
+    kv_pos_ptr,
     seq_lens_ptr,
+    logical_seq_lens_ptr,
     idx_mapping_ptr,
     query_start_loc_ptr,
     num_computed_tokens_ptr,
+    num_resident_tokens_ptr,
     max_num_reqs,
     BLOCK_SIZE: tl.constexpr,
 ):
@@ -249,41 +273,51 @@ def _prepare_pos_seq_lens_kernel(
             block = i + tl.arange(0, BLOCK_SIZE)
             mask = block < max_num_reqs
             tl.store(seq_lens_ptr + block, 0, mask=mask)
+            tl.store(logical_seq_lens_ptr + block, 0, mask=mask)
         return
 
     req_state_idx = tl.load(idx_mapping_ptr + req_id)
     num_computed_tokens = tl.load(num_computed_tokens_ptr + req_state_idx)
+    num_resident_tokens = tl.load(num_resident_tokens_ptr + req_id)
 
     start = tl.load(query_start_loc_ptr + req_id)
     end = tl.load(query_start_loc_ptr + req_id + 1)
     query_len = end - start
 
-    seq_len = num_computed_tokens + query_len
-    tl.store(seq_lens_ptr + req_id, seq_len)
+    tl.store(seq_lens_ptr + req_id, num_resident_tokens + query_len)
+    tl.store(logical_seq_lens_ptr + req_id, num_computed_tokens + query_len)
 
     for i in tl.range(0, query_len, BLOCK_SIZE):
         block = i + tl.arange(0, BLOCK_SIZE)
         mask = block < query_len
         pos = num_computed_tokens + block
+        kv_pos = num_resident_tokens + block
         tl.store(pos_ptr + start + block, pos, mask=mask)
+        tl.store(kv_pos_ptr + start + block, kv_pos, mask=mask)
 
 
 def prepare_pos_seq_lens(
     idx_mapping: torch.Tensor,
     query_start_loc: torch.Tensor,
     num_computed_tokens: torch.Tensor,
+    num_resident_tokens: torch.Tensor,
     pos: torch.Tensor,
+    kv_pos: torch.Tensor,
     seq_lens: torch.Tensor,
+    logical_seq_lens: torch.Tensor,
 ) -> None:
     num_reqs = idx_mapping.shape[0]
     # NOTE(woosuk): We do +1 because the last thread block is used
     # to pad unused seq_lens as 0 for full CUDA graphs.
     _prepare_pos_seq_lens_kernel[(num_reqs + 1,)](
         pos,
+        kv_pos,
         seq_lens,
+        logical_seq_lens,
         idx_mapping,
         query_start_loc,
         num_computed_tokens,
+        num_resident_tokens,
         seq_lens.shape[0],
         BLOCK_SIZE=1024,
     )

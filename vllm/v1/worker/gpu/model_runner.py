@@ -108,6 +108,10 @@ from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
+from vllm.v1.worker.paged_eviction import (
+    PagedEvictionWorkerState,
+    validate_paged_eviction_attention_groups,
+)
 from vllm.v1.worker.utils import KVBlockZeroer
 
 logger = init_logger(__name__)
@@ -125,6 +129,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.scheduler_config = vllm_config.scheduler_config
         self.speculative_config = vllm_config.speculative_config
         self.observability_config = vllm_config.observability_config
+        self.paged_eviction = PagedEvictionWorkerState(
+            vllm_config.paged_eviction_config,
+            vllm_config.cache_config.block_size,
+        )
 
         self.device = device
         self.dtype = self.model_config.dtype
@@ -431,6 +439,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.attn_groups, attn_cg_support, self.kernel_block_sizes = init_attn_backend(
             self.kv_cache_config, self.vllm_config, self.device
         )
+        validate_paged_eviction_attention_groups(
+            self.vllm_config.paged_eviction_config,
+            self.attn_groups,
+        )
+        if self.paged_eviction.enabled:
+            self.paged_eviction.set_block_size(
+                self.kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size
+            )
         self.block_tables = BlockTables(
             block_sizes=block_sizes,
             max_num_reqs=self.max_num_reqs,
@@ -776,6 +792,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.block_tables.append_block_ids(
                 req_index, new_req_data.block_ids, overwrite=True
             )
+            self.paged_eviction.set_request_blocks(req_id, new_req_data.block_ids[0])
             self.lora_state.add_request(req_id, req_index, new_req_data.lora_request)
 
             if self.is_last_pp_rank and new_req_data.sampling_params is not None:
@@ -797,16 +814,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def update_requests(self, scheduler_output: SchedulerOutput) -> None:
         # Add new blocks and update num_computed_tokens for the existing requests.
         reqs = scheduler_output.scheduled_cached_reqs
+        replacement_block_tables = scheduler_output.paged_eviction_block_tables or {}
         num_computed_tokens_np = self.req_states.num_computed_tokens_np
         for req_id, num_computed_tokens, req_new_block_ids in zip(
             reqs.req_ids, reqs.num_computed_tokens, reqs.new_block_ids
         ):
             req_index = self.req_states.req_id_to_index[req_id]
             num_computed_tokens_np[req_index] = num_computed_tokens
-            if req_new_block_ids is not None:
+            replacement_block_ids = replacement_block_tables.get(req_id)
+            if replacement_block_ids is not None:
+                self.block_tables.append_block_ids(
+                    req_index, replacement_block_ids, overwrite=True
+                )
+                self.paged_eviction.set_request_blocks(req_id, replacement_block_ids[0])
+            elif req_new_block_ids is not None:
                 self.block_tables.append_block_ids(
                     req_index, req_new_block_ids, overwrite=False
                 )
+                self.paged_eviction.append_request_blocks(req_id, req_new_block_ids[0])
 
         # Update CPU num_computed_prefill_tokens.
         np.minimum(
@@ -905,14 +930,31 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
 
         # Prepare positions and seq_lens.
+        num_computed_tokens_np = self.req_states.num_computed_tokens_np[idx_mapping_np]
+        if self.paged_eviction.enabled:
+            num_resident_tokens_np = np.fromiter(
+                (self.paged_eviction.resident_tokens[req_id] for req_id in req_ids),
+                dtype=np.int32,
+                count=num_reqs,
+            )
+        else:
+            num_resident_tokens_np = num_computed_tokens_np
+        async_copy_to_gpu(
+            num_resident_tokens_np,
+            out=self.input_buffers.num_resident_tokens[:num_reqs],
+        )
         prepare_pos_seq_lens(
             idx_mapping,
             query_start_loc,
             self.req_states.num_computed_tokens.gpu,
+            self.input_buffers.num_resident_tokens,
             self.input_buffers.positions,
+            self.input_buffers.kv_positions,
             self.input_buffers.seq_lens,
+            self.input_buffers.logical_seq_lens,
         )
         seq_lens = self.input_buffers.seq_lens[:num_reqs_padded]
+        logical_seq_lens = self.input_buffers.logical_seq_lens[:num_reqs_padded]
 
         dcp_local_seq_lens = None
         if self.use_dcp:
@@ -934,7 +976,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             idx_mapping,
             self.req_states.last_sampled_tokens,
             query_start_loc,
-            seq_lens,
+            logical_seq_lens,
             self.req_states.prefill_len.gpu,
             self.req_states.draft_tokens,
             cu_num_logits,
@@ -943,10 +985,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
         # CPU upper bound on seq_lens; padded entries left at zero.
-        num_computed_tokens_np = self.req_states.num_computed_tokens_np[idx_mapping_np]
         seq_lens_cpu_upper_bound_np = np.zeros(num_reqs_padded, dtype=np.int32)
         np.add(
-            num_computed_tokens_np,
+            num_resident_tokens_np,
             num_scheduled_tokens,
             out=seq_lens_cpu_upper_bound_np[:num_reqs],
         )
@@ -972,15 +1013,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             query_start_loc=query_start_loc,
             query_start_loc_np=query_start_loc_np,
             seq_lens=seq_lens,
+            logical_seq_lens=logical_seq_lens,
             seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
             dcp_local_seq_lens=dcp_local_seq_lens,
             num_computed_tokens_np=num_computed_tokens_np,
+            num_resident_tokens_np=num_resident_tokens_np,
             prefill_len_np=prefill_len_np,
             num_computed_prefill_tokens_np=num_computed_prefill_tokens_np,
             is_prefilling_np=is_prefilling_np,
             max_seq_len_np=max_seq_len_np,
             input_ids=self.input_buffers.input_ids[:num_tokens_after_padding],
             positions=self.input_buffers.positions[:num_tokens_after_padding],
+            kv_positions=self.input_buffers.kv_positions[:num_tokens_after_padding],
             logits_indices=logits_indices,
             cu_num_logits=cu_num_logits,
             cu_num_logits_np=cu_num_logits_np,
@@ -1000,7 +1044,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         slot_mappings = self.block_tables.compute_slot_mappings(
             input_batch.idx_mapping,
             input_batch.query_start_loc,
-            input_batch.positions,
+            input_batch.kv_positions,
             num_tokens_padded=input_batch.num_tokens_after_padding,
         )
         return block_tables, slot_mappings
@@ -1087,6 +1131,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         is_profile: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         if not dummy_run:
+            finished_or_preempted_req_ids = set(scheduler_output.finished_req_ids)
+            if scheduler_output.preempted_req_ids:
+                finished_or_preempted_req_ids.update(scheduler_output.preempted_req_ids)
+            self.paged_eviction.update_from_scheduler(
+                scheduler_output.paged_eviction_num_resident_tokens,
+                finished_or_preempted_req_ids,
+            )
+            for new_req_data in scheduler_output.scheduled_new_reqs:
+                self.paged_eviction.invalidate_blocks(
+                    block_id for group in new_req_data.block_ids for block_id in group
+                )
+            for new_block_ids in scheduler_output.scheduled_cached_reqs.new_block_ids:
+                if new_block_ids is not None:
+                    self.paged_eviction.invalidate_blocks(
+                        block_id for group in new_block_ids for block_id in group
+                    )
             # Update the request states.
             self.update_pp_decode_requests()
             self.finish_requests(scheduler_output)
@@ -1372,6 +1432,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.req_states.prompt_len.np,
         )
 
+        num_scheduled_tokens = dict(
+            zip(input_batch.req_ids, input_batch.num_scheduled_tokens.tolist())
+        )
+        paged_eviction_scores = self.paged_eviction.score_requests(
+            self.kv_caches,
+            {
+                req_id: self.paged_eviction.request_block_ids[req_id]
+                for req_id in input_batch.req_ids
+            },
+            num_scheduled_tokens,
+        )
+
         # Prepare the model runner output.
         model_runner_output = ModelRunnerOutput(
             req_ids=input_batch.req_ids,
@@ -1380,6 +1452,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             req_id_to_index={req_id: i for i, req_id in enumerate(input_batch.req_ids)},
             sampled_token_ids=None,  # type: ignore
             prompt_logprobs_dict=prompt_logprobs_dict,  # type: ignore[arg-type]
+            paged_eviction_scores=paged_eviction_scores,
         )
         # Start async output copy here so that it can overlap with speculator proposal.
         async_output = AsyncOutput(

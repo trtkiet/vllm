@@ -42,6 +42,7 @@ from .mamba import MambaConfig
 from .model import ModelConfig
 from .observability import ObservabilityConfig
 from .offload import OffloadConfig
+from .paged_eviction import PagedEvictionConfig
 from .parallel import ParallelConfig
 from .profiler import ProfilerConfig
 from .reasoning import ReasoningConfig
@@ -326,6 +327,8 @@ class VllmConfig:
     """LoRA configuration."""
     speculative_config: SpeculativeConfig | None = None
     """Speculative decoding configuration."""
+    paged_eviction_config: PagedEvictionConfig | None = None
+    """Decode-only block-wise KV cache eviction configuration."""
     diffusion_config: DiffusionConfig | None = None
     """Diffusion LLM (dLLM) configuration."""
 
@@ -452,6 +455,10 @@ class VllmConfig:
             vllm_factors.append("None")
         if self.speculative_config:
             vllm_factors.append(self.speculative_config.compute_hash())
+        else:
+            vllm_factors.append("None")
+        if self.paged_eviction_config:
+            vllm_factors.append(self.paged_eviction_config.compute_hash())
         else:
             vllm_factors.append("None")
         if self.structured_outputs_config:
@@ -860,6 +867,80 @@ class VllmConfig:
             "expandable_segments is automatically disabled)."
         )
 
+    def _validate_paged_eviction_config(self) -> None:
+        config = self.paged_eviction_config
+        if config is None or not config.enabled:
+            return
+
+        from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+        if self.device_config.device_type != "cuda":
+            raise ValueError("PagedEviction currently requires a CUDA device.")
+        if self.model_config is None:
+            raise ValueError("PagedEviction requires a model configuration.")
+        if self.model_config.runner_type != "generate":
+            raise ValueError("PagedEviction only supports generative models.")
+        if self.model_config.is_encoder_decoder:
+            raise ValueError("PagedEviction only supports decoder-only models.")
+        if self.model_config.is_multimodal_model:
+            raise ValueError("PagedEviction does not support multimodal models.")
+        if self.model_config.is_hybrid:
+            raise ValueError("PagedEviction does not support hybrid attention models.")
+        if self.model_config.use_mla:
+            raise ValueError("PagedEviction does not support MLA models.")
+        if not self.model_config.enforce_eager:
+            raise ValueError("PagedEviction requires eager execution.")
+        if not self.model_config.disable_cascade_attn:
+            raise ValueError("PagedEviction does not support cascade attention.")
+
+        parallel_config = self.parallel_config
+        if (
+            parallel_config.tensor_parallel_size != 1
+            or parallel_config.pipeline_parallel_size != 1
+            or parallel_config.data_parallel_size != 1
+            or parallel_config.prefill_context_parallel_size != 1
+            or parallel_config.decode_context_parallel_size != 1
+        ):
+            raise ValueError("PagedEviction currently requires TP=PP=DP=PCP=DCP=1.")
+
+        if self.scheduler_config.async_scheduling:
+            raise ValueError("PagedEviction requires synchronous scheduling.")
+        if self.scheduler_config.enable_chunked_prefill:
+            raise ValueError("PagedEviction does not support chunked prefill.")
+        if self.scheduler_config.scheduler_cls is not None:
+            raise ValueError("PagedEviction requires the default scheduler.")
+        if self.speculative_config is not None:
+            raise ValueError("PagedEviction does not support speculative decoding.")
+        if self.diffusion_config is not None:
+            raise ValueError("PagedEviction does not support diffusion models.")
+        if self.cache_config.enable_prefix_caching:
+            raise ValueError("PagedEviction does not support prefix caching.")
+        cache_dtype = self.cache_config.cache_dtype
+        if cache_dtype == "auto":
+            cache_dtype = str(self.model_config.dtype).removeprefix("torch.")
+        if cache_dtype not in ("float16", "bfloat16"):
+            raise ValueError(
+                "PagedEviction requires an unquantized float16 or bfloat16 KV cache."
+            )
+        if self.cache_config.sliding_window is not None:
+            raise ValueError("PagedEviction requires full attention.")
+        if config.cache_budget_tokens % self.cache_config.block_size != 0:
+            raise ValueError("PagedEviction cache_budget_tokens must be block-aligned.")
+        if (
+            self.attention_config.backend is not None
+            and self.attention_config.backend != AttentionBackendEnum.FLASH_ATTN
+        ):
+            raise ValueError(
+                "PagedEviction currently requires the FlashAttention backend."
+            )
+        if (
+            self.kv_transfer_config is not None
+            and self.kv_transfer_config.kv_connector is not None
+        ):
+            raise ValueError("PagedEviction does not support KV connectors.")
+        if self.ec_transfer_config is not None:
+            raise ValueError("PagedEviction does not support EC connectors.")
+
     def __post_init__(self):
         """Verify configs are valid & consistent with each other."""
 
@@ -870,6 +951,7 @@ class VllmConfig:
             logger.info_once("Performance mode set to '%s'.", self.performance_mode)
 
         self.try_verify_and_update_config()
+        self._validate_paged_eviction_config()
 
         if self.model_config is not None:
             self.model_config.verify_with_parallel_config(self.parallel_config)

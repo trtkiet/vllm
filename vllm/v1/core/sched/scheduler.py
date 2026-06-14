@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import math
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
@@ -30,6 +31,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.multimodal.utils import get_mm_features_in_window
+from vllm.utils.math_utils import cdiv
 from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
@@ -51,7 +53,7 @@ from vllm.v1.core.sched.request_queue import (
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
@@ -62,6 +64,13 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class PagedEvictionRequestState:
+    resident_tokens: int = 0
+    block_ids: list[int] = field(default_factory=list)
+    block_table_dirty: bool = False
 
 
 class Scheduler(SchedulerInterface):
@@ -157,6 +166,13 @@ class Scheduler(SchedulerInterface):
         self.block_size = block_size
         self.dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
         self.pcp_world_size = vllm_config.parallel_config.prefill_context_parallel_size
+        self.paged_eviction_config = vllm_config.paged_eviction_config
+        self.paged_eviction_states: dict[str, PagedEvictionRequestState] = {}
+        if (
+            self.paged_eviction_config is not None
+            and self.paged_eviction_config.enabled
+        ):
+            self._validate_paged_eviction_kv_cache()
 
         # req_id -> Request
         self.requests: dict[str, Request] = {}
@@ -303,6 +319,39 @@ class Scheduler(SchedulerInterface):
         # In-flight requests still prefilling (prefill chunks + in-progress
         # async KV loads). Their remaining-block reservation gates async loads.
         self._inflight_prefills: set[Request] = set()
+
+    @property
+    def paged_eviction_enabled(self) -> bool:
+        config = getattr(self, "paged_eviction_config", None)
+        return config is not None and config.enabled
+
+    def _validate_paged_eviction_kv_cache(self) -> None:
+        if len(self.kv_cache_config.kv_cache_groups) != 1:
+            raise ValueError(
+                "PagedEviction requires exactly one full-attention KV cache group."
+            )
+        spec = self.kv_cache_config.kv_cache_groups[0].kv_cache_spec
+        if (
+            not isinstance(spec, FullAttentionSpec)
+            or spec.sliding_window is not None
+            or spec.attention_chunk_size is not None
+        ):
+            raise ValueError(
+                "PagedEviction requires one non-sliding full-attention KV cache group."
+            )
+        assert self.paged_eviction_config is not None
+        if self.paged_eviction_config.cache_budget_tokens % spec.block_size != 0:
+            raise ValueError(
+                "PagedEviction cache_budget_tokens must align with the KV block size."
+            )
+
+    def _paged_eviction_required_tokens(
+        self, request_id: str, num_new_tokens: int
+    ) -> int | None:
+        if not self.paged_eviction_enabled:
+            return None
+        state = self.paged_eviction_states[request_id]
+        return state.resident_tokens + num_new_tokens
 
     def _mamba_block_aligned_split(
         self,
@@ -491,6 +540,9 @@ class Scheduler(SchedulerInterface):
                         request,
                         num_new_tokens,
                         num_lookahead_tokens=self.num_lookahead_tokens,
+                        num_required_tokens=self._paged_eviction_required_tokens(
+                            request.request_id, num_new_tokens
+                        ),
                     )
 
                     if new_blocks is not None:
@@ -843,6 +895,9 @@ class Scheduler(SchedulerInterface):
                     full_sequence_must_fit=self.scheduler_reserve_full_isl,
                     reserved_blocks=reserved_blocks,
                     has_scheduled_reqs=bool(self.running),
+                    num_required_tokens=self._paged_eviction_required_tokens(
+                        request.request_id, num_new_tokens
+                    ),
                 )
 
                 if new_blocks is None:
@@ -993,6 +1048,26 @@ class Scheduler(SchedulerInterface):
                 req_to_new_blocks,
             )
 
+        paged_eviction_num_resident_tokens = None
+        paged_eviction_block_tables = None
+        if self.paged_eviction_enabled:
+            paged_eviction_num_resident_tokens = {}
+            for req_id in num_scheduled_tokens:
+                state = self.paged_eviction_states[req_id]
+                state.block_ids = self.kv_cache_manager.get_blocks(
+                    req_id
+                ).get_block_ids()[0]
+                paged_eviction_num_resident_tokens[req_id] = state.resident_tokens
+
+            paged_eviction_block_tables = {}
+            for req_id in cached_reqs_data.req_ids:
+                state = self.paged_eviction_states[req_id]
+                if state.block_table_dirty:
+                    paged_eviction_block_tables[req_id] = (
+                        self.kv_cache_manager.get_blocks(req_id).get_block_ids()
+                    )
+                    state.block_table_dirty = False
+
         # Record the request ids that were scheduled in this step.
         self.prev_step_scheduled_req_ids.clear()
         self.prev_step_scheduled_req_ids.update(num_scheduled_tokens.keys())
@@ -1026,6 +1101,8 @@ class Scheduler(SchedulerInterface):
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
+            paged_eviction_num_resident_tokens=paged_eviction_num_resident_tokens,
+            paged_eviction_block_tables=paged_eviction_block_tables,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
         )
 
@@ -1062,11 +1139,24 @@ class Scheduler(SchedulerInterface):
         assert request.status == RequestStatus.RUNNING, (
             "Only running requests can be preempted"
         )
+        if self.paged_eviction_enabled:
+            assert self.paged_eviction_config is not None
+            logical_slots = cdiv(request.num_tokens, self.block_size) * self.block_size
+            if logical_slots > self.paged_eviction_config.cache_budget_tokens:
+                raise RuntimeError(
+                    f"Cannot preempt PagedEviction request {request.request_id!r}: "
+                    f"its logical sequence requires {logical_slots} KV slots, "
+                    "which exceeds the decode-only cache budget of "
+                    f"{self.paged_eviction_config.cache_budget_tokens}. "
+                    "Prefill compression is not supported."
+                )
         self.kv_cache_manager.free(request)
         self.encoder_cache_manager.free(request)
         self._inflight_prefills.discard(request)
         request.status = RequestStatus.PREEMPTED
         request.num_computed_tokens = 0
+        if self.paged_eviction_enabled:
+            self.paged_eviction_states[request.request_id] = PagedEvictionRequestState()
         if request.spec_token_ids:
             request.spec_token_ids = []
         request.num_preemptions += 1
@@ -1408,6 +1498,78 @@ class Scheduler(SchedulerInterface):
         )
         return GrammarOutput(structured_output_request_ids, bitmask)
 
+    def _update_paged_eviction(
+        self,
+        scheduler_output: SchedulerOutput,
+        model_runner_output: ModelRunnerOutput,
+    ) -> None:
+        if not self.paged_eviction_enabled:
+            return
+
+        assert self.paged_eviction_config is not None
+        budget = self.paged_eviction_config.cache_budget_tokens
+        scores_by_request = model_runner_output.paged_eviction_scores or {}
+
+        for (
+            req_id,
+            num_scheduled_tokens,
+        ) in scheduler_output.num_scheduled_tokens.items():
+            request = self.requests.get(req_id)
+            if request is None or request.is_finished():
+                continue
+
+            state = self.paged_eviction_states[req_id]
+            state.resident_tokens += num_scheduled_tokens
+            state.block_ids = self.kv_cache_manager.get_blocks(req_id).get_block_ids()[
+                0
+            ]
+
+            if (
+                state.resident_tokens <= budget
+                or state.resident_tokens % self.block_size != 0
+            ):
+                continue
+
+            expected_num_blocks = state.resident_tokens // self.block_size
+            if len(state.block_ids) != expected_num_blocks:
+                raise RuntimeError(
+                    f"PagedEviction request {req_id!r} has "
+                    f"{len(state.block_ids)} blocks for "
+                    f"{state.resident_tokens} resident tokens."
+                )
+            if len(set(state.block_ids)) != len(state.block_ids):
+                raise RuntimeError(
+                    f"PagedEviction request {req_id!r} has duplicate block IDs."
+                )
+
+            block_scores = scores_by_request.get(req_id)
+            if block_scores is None:
+                raise RuntimeError(
+                    f"Missing PagedEviction scores for request {req_id!r}."
+                )
+            missing_scores = [
+                block_id
+                for block_id in state.block_ids
+                if block_id not in block_scores
+                or not math.isfinite(block_scores[block_id])
+            ]
+            if missing_scores:
+                raise RuntimeError(
+                    f"Missing valid PagedEviction scores for request {req_id!r} "
+                    f"blocks {missing_scores}."
+                )
+
+            block_id_to_evict = min(
+                state.block_ids,
+                key=block_scores.__getitem__,
+            )
+            self.kv_cache_manager.remove_active_block(req_id, block_id_to_evict)
+            state.resident_tokens -= self.block_size
+            state.block_ids = self.kv_cache_manager.get_blocks(req_id).get_block_ids()[
+                0
+            ]
+            state.block_table_dirty = True
+
     def update_from_output(
         self,
         scheduler_output: SchedulerOutput,
@@ -1421,6 +1583,8 @@ class Scheduler(SchedulerInterface):
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
+
+        self._update_paged_eviction(scheduler_output, model_runner_output)
 
         perf_stats: PerfStats | None = None
         if self.perf_metrics and self.perf_metrics.is_enabled():
@@ -1900,6 +2064,21 @@ class Scheduler(SchedulerInterface):
 
     def add_request(self, request: Request) -> None:
         existing = self.requests.get(request.request_id)
+        if self.paged_eviction_enabled:
+            if existing is not None:
+                raise ValueError("PagedEviction does not support streaming requests.")
+            assert self.paged_eviction_config is not None
+            rounded_prompt_tokens = (
+                cdiv(request.num_prompt_tokens, self.block_size) * self.block_size
+            )
+            if rounded_prompt_tokens > self.paged_eviction_config.cache_budget_tokens:
+                raise ValueError(
+                    f"Request {request.request_id!r} prompt requires "
+                    f"{rounded_prompt_tokens} block-aligned KV tokens, exceeding "
+                    "the PagedEviction cache budget of "
+                    f"{self.paged_eviction_config.cache_budget_tokens}."
+                )
+            self.paged_eviction_states[request.request_id] = PagedEvictionRequestState()
         if existing is not None:
             update = StreamingUpdate.from_request(request)
             if existing.status != RequestStatus.WAITING_FOR_STREAMING_REQ:
@@ -2007,6 +2186,9 @@ class Scheduler(SchedulerInterface):
     def _free_blocks(self, request: Request):
         assert request.is_finished()
         self.kv_cache_manager.free(request)
+        states = getattr(self, "paged_eviction_states", None)
+        if states is not None:
+            states.pop(request.request_id, None)
         del self.requests[request.request_id]
 
     @property

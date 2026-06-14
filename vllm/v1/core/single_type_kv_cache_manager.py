@@ -377,6 +377,35 @@ class SingleTypeKVCacheManager(ABC):
         self.block_pool.free_blocks(ordered_blocks)
         self.num_cached_block.pop(request_id, None)
 
+    def remove_active_block(self, request_id: str, block_id: int) -> None:
+        """Remove one exclusively owned block from an active request."""
+        blocks = self.req_to_blocks.get(request_id)
+        if not blocks:
+            raise ValueError(f"Request {request_id!r} has no allocated KV blocks.")
+
+        matching_indices = [
+            i for i, block in enumerate(blocks) if block.block_id == block_id
+        ]
+        if len(matching_indices) != 1:
+            raise ValueError(
+                f"Block {block_id} is not uniquely owned by request {request_id!r}."
+            )
+
+        block_index = matching_indices[0]
+        block = blocks[block_index]
+        if block.is_null:
+            raise ValueError("Cannot remove the null KV cache block.")
+        if block.ref_cnt != 1:
+            raise ValueError(
+                f"Cannot remove shared KV cache block {block_id} "
+                f"with ref_cnt={block.ref_cnt}."
+            )
+        if block.block_hash is not None or request_id in self.num_cached_block:
+            raise ValueError("Cannot actively remove a prefix-cached KV cache block.")
+
+        blocks.pop(block_index)
+        self.block_pool.free_blocks([block], prepend=True)
+
     @abstractmethod
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
         """

@@ -145,7 +145,7 @@ class BlockTables:
         self,
         idx_mapping: torch.Tensor,
         query_start_loc: torch.Tensor,
-        positions: torch.Tensor,
+        kv_positions: torch.Tensor,
         num_tokens_padded: int,
     ) -> torch.Tensor:
         num_reqs = idx_mapping.shape[0]
@@ -154,7 +154,7 @@ class BlockTables:
             self.max_num_batched_tokens,
             idx_mapping,
             query_start_loc,
-            positions,
+            kv_positions,
             self.block_table_ptrs,
             self.block_table_strides,
             self.block_sizes_tensor,

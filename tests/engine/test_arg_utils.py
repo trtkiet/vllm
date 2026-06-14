@@ -232,6 +232,18 @@ def test_hf_token_cli_arg(cli_args, expected):
     assert args.hf_token == expected
 
 
+def test_paged_eviction_config_cli_arg(monkeypatch):
+    from vllm.platforms import current_platform
+
+    monkeypatch.setattr(current_platform, "device_type", "cpu")
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args(
+        ["--paged-eviction-config", '{"cache_budget_tokens": 4096}']
+    )
+
+    assert args.paged_eviction_config == {"cache_budget_tokens": 4096}
+
+
 @pytest.mark.parametrize(
     ("arg", "expected"),
     [

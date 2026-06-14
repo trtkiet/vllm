@@ -142,16 +142,16 @@ class BlockTable:
         self,
         num_reqs: int,
         query_start_loc: torch.Tensor,
-        positions: torch.Tensor,
+        kv_positions: torch.Tensor,
     ) -> None:
-        num_tokens = positions.shape[0]
+        num_tokens = kv_positions.shape[0]
         total_cp_world_size = self.pcp_world_size * self.dcp_world_size
         total_cp_rank = self.pcp_rank * self.dcp_world_size + self.dcp_rank
         _compute_slot_mapping_kernel[(num_reqs + 1,)](
             num_tokens,
             self.max_num_batched_tokens,
             query_start_loc,
-            positions,
+            kv_positions,
             self.block_table.gpu,
             self.block_table.gpu.stride(0),
             self.block_size,
@@ -304,10 +304,10 @@ class MultiGroupBlockTable:
         self,
         num_reqs: int,
         query_start_loc: torch.Tensor,
-        positions: torch.Tensor,
+        kv_positions: torch.Tensor,
     ) -> None:
         for block_table in self.block_tables:
-            block_table.compute_slot_mapping(num_reqs, query_start_loc, positions)
+            block_table.compute_slot_mapping(num_reqs, query_start_loc, kv_positions)
 
     def commit_block_table(self, num_reqs: int) -> None:
         for block_table in self.block_tables:
