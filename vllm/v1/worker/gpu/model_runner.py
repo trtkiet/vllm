@@ -1435,12 +1435,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         num_scheduled_tokens = dict(
             zip(input_batch.req_ids, input_batch.num_scheduled_tokens.tolist())
         )
-        paged_eviction_scores = self.paged_eviction.score_requests(
-            self.kv_caches,
-            {
+        request_block_ids = {}
+        if self.paged_eviction.enabled:
+            request_block_ids = {
                 req_id: self.paged_eviction.request_block_ids[req_id]
                 for req_id in input_batch.req_ids
-            },
+            }
+        paged_eviction_scores = self.paged_eviction.score_requests(
+            self.kv_caches,
+            request_block_ids,
             num_scheduled_tokens,
         )
 
