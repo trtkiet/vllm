@@ -272,6 +272,9 @@ class Scheduler(SchedulerInterface):
             metrics_collector=self.kv_metrics_collector,
             watermark=self.scheduler_config.watermark,
         )
+        self.paged_eviction_max_running_reqs: int | None = None
+        if self.paged_eviction_enabled:
+            self._initialize_paged_eviction_capacity()
         # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.
         if self.connector is not None:
@@ -344,6 +347,26 @@ class Scheduler(SchedulerInterface):
             raise ValueError(
                 "PagedEviction cache_budget_tokens must align with the KV block size."
             )
+
+    def _initialize_paged_eviction_capacity(self) -> None:
+        """Set the safe active-request cap for PagedEviction."""
+        assert self.paged_eviction_config is not None
+        budget_blocks = (
+            self.paged_eviction_config.cache_budget_tokens // self.block_size
+        )
+        usable_pool_blocks = self.kv_cache_manager.block_pool.get_num_free_blocks()
+        max_running_reqs = usable_pool_blocks // (budget_blocks + 1)
+        if max_running_reqs < 1:
+            raise ValueError(
+                "PagedEviction requires enough usable KV capacity for one cache "
+                f"budget plus one temporary block, but has {usable_pool_blocks} "
+                f"blocks and requires {budget_blocks + 1}."
+            )
+        self.paged_eviction_max_running_reqs = max_running_reqs
+
+    def _paged_eviction_capacity_reached(self) -> bool:
+        max_running_reqs = getattr(self, "paged_eviction_max_running_reqs", None)
+        return max_running_reqs is not None and len(self.running) >= max_running_reqs
 
     def _paged_eviction_required_tokens(
         self, request_id: str, num_new_tokens: int
@@ -645,6 +668,8 @@ class Scheduler(SchedulerInterface):
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
+                    break
+                if self._paged_eviction_capacity_reached():
                     break
 
                 request_queue = self._select_waiting_queue_for_scheduling()

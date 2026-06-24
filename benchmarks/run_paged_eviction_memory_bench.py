@@ -41,6 +41,11 @@ MODEL = "meta-llama/Llama-3.1-8B"
 BYTES_PER_KV_TOKEN_LLAMA_3_1_8B = 32 * 2 * 8 * 128 * 2
 KV_CACHE_SIZE_RE = re.compile(r"GPU KV cache size:\s*([0-9,]+)\s+tokens")
 KV_CACHE_USAGE_METRIC = "vllm:kv_cache_usage_perc"
+SERVER_ERROR_RE = re.compile(
+    r"(?:\b(?:ERROR|CRITICAL)\b|Traceback \(most recent call last\)|"
+    r"\bRuntimeError:|[Uu]ncaught (?:runtime )?[Ee]xception)"
+)
+RUNNER_ENV = {"legacy": "0", "v2": "1"}
 
 
 @dataclass
@@ -52,12 +57,16 @@ class RunArtifacts:
     nvidia_smi_csv: str
     metrics_jsonl: str
     command_json: str
+    gsm8k_json: str
+    wikitext_json: str
 
 
 @dataclass
 class RunSummary:
+    runner: str
     label: str
     paged_eviction_enabled: bool
+    completion_status: str
     artifacts: RunArtifacts
     completed: int | None
     failed: int | None
@@ -77,6 +86,9 @@ class RunSummary:
     kv_cache_capacity_bytes: int | None
     peak_kv_cache_usage_fraction: float | None
     derived_peak_kv_cache_bytes: float | None
+    gsm8k_accuracy: float | None
+    wikitext_word_perplexity: float | None
+    validation_passed: bool
     validation_errors: list[str]
 
 
@@ -307,6 +319,12 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     server.add_argument("--cache-budget-tokens", type=int, default=1024)
+    server.add_argument(
+        "--runner",
+        choices=("legacy", "v2", "both"),
+        default="both",
+        help="Model runner(s) to benchmark. Each runner uses a fresh server.",
+    )
 
     workload = parser.add_argument_group("workload")
     workload.add_argument("--num-prompts", type=int, default=128)
@@ -324,6 +342,17 @@ def parse_args() -> argparse.Namespace:
             "64 output tokens, and concurrency 2."
         ),
     )
+
+    quality = parser.add_argument_group("quality")
+    quality.add_argument(
+        "--skip-quality",
+        action="store_true",
+        help="Skip GSM8K accuracy and WikiText perplexity evaluation.",
+    )
+    quality.add_argument("--gsm8k-limit", type=int, default=8)
+    quality.add_argument("--gsm8k-max-tokens", type=int, default=2048)
+    quality.add_argument("--wikitext-limit", type=int, default=4)
+    quality.add_argument("--wikitext-max-words", type=int, default=256)
 
     artifacts = parser.add_argument_group("artifacts")
     artifacts.add_argument(
@@ -368,7 +397,19 @@ def parse_args() -> argparse.Namespace:
         args.random_input_len = 512
         args.random_output_len = 64
         args.max_concurrency = 2
+        args.gsm8k_limit = min(args.gsm8k_limit, 2)
+        args.wikitext_limit = min(args.wikitext_limit, 2)
     return args
+
+
+def selected_runners(runner: str) -> list[str]:
+    return list(RUNNER_ENV) if runner == "both" else [runner]
+
+
+def server_environment(runner: str) -> dict[str, str]:
+    env = os.environ.copy()
+    env["VLLM_USE_V2_MODEL_RUNNER"] = RUNNER_ENV[runner]
+    return env
 
 
 def default_gpu_index() -> str:
@@ -499,10 +540,11 @@ def assert_port_available(args: argparse.Namespace) -> None:
 def run_one(
     args: argparse.Namespace,
     root_dir: Path,
+    runner: str,
     label: str,
     enabled: bool,
 ) -> RunSummary:
-    run_dir = root_dir / label
+    run_dir = root_dir / runner / label
     run_dir.mkdir(parents=True, exist_ok=True)
     artifacts = RunArtifacts(
         run_dir=str(run_dir),
@@ -512,6 +554,8 @@ def run_one(
         nvidia_smi_csv=str(run_dir / "nvidia_smi.csv"),
         metrics_jsonl=str(run_dir / "metrics_samples.jsonl"),
         command_json=str(run_dir / "commands.json"),
+        gsm8k_json=str(run_dir / "gsm8k.json"),
+        wikitext_json=str(run_dir / "wikitext.json"),
     )
 
     server_command = build_server_command(args, enabled)
@@ -521,12 +565,14 @@ def run_one(
         {
             "server_command": server_command,
             "benchmark_command": benchmark_command,
+            "environment": {"VLLM_USE_V2_MODEL_RUNNER": RUNNER_ENV[runner]},
+            "runner": runner,
             "paged_eviction_enabled": enabled,
         },
     )
 
     if args.dry_run:
-        return empty_summary(label, enabled, artifacts)
+        return empty_summary(runner, label, enabled, artifacts)
 
     phase = Phase("idle")
     memory_sampler = NvidiaSmiSampler(
@@ -551,6 +597,7 @@ def run_one(
                 stderr=subprocess.STDOUT,
                 text=True,
                 start_new_session=True,
+                env=server_environment(runner),
             )
 
             wait_for_health(args, server_proc, Path(artifacts.server_log))
@@ -571,6 +618,10 @@ def run_one(
             phase.set("benchmark")
             run_benchmark(benchmark_command, Path(artifacts.benchmark_log))
 
+            if not args.skip_quality:
+                phase.set("quality")
+                run_quality_evaluation(args, artifacts)
+
             phase.set("post_bench")
             memory_sampler.sample_now("post_bench")
             metrics_sampler.sample_now("post_bench")
@@ -582,13 +633,20 @@ def run_one(
             wait_for_health_down(args, timeout_s=30.0)
         memory_sampler.stop()
 
-    return summarize_run(args, label, enabled, artifacts)
+    return summarize_run(args, runner, label, enabled, artifacts)
 
 
-def empty_summary(label: str, enabled: bool, artifacts: RunArtifacts) -> RunSummary:
+def empty_summary(
+    runner: str,
+    label: str,
+    enabled: bool,
+    artifacts: RunArtifacts,
+) -> RunSummary:
     return RunSummary(
+        runner=runner,
         label=label,
         paged_eviction_enabled=enabled,
+        completion_status="not_run",
         artifacts=artifacts,
         completed=None,
         failed=None,
@@ -608,6 +666,9 @@ def empty_summary(label: str, enabled: bool, artifacts: RunArtifacts) -> RunSumm
         kv_cache_capacity_bytes=None,
         peak_kv_cache_usage_fraction=None,
         derived_peak_kv_cache_bytes=None,
+        gsm8k_accuracy=None,
+        wikitext_word_perplexity=None,
+        validation_passed=True,
         validation_errors=[],
     )
 
@@ -670,6 +731,125 @@ def run_benchmark(command: list[str], log_path: Path) -> None:
         )
 
 
+def post_completion(
+    args: argparse.Namespace, payload: dict[str, Any]
+) -> dict[str, Any]:
+    payload = {"model": args.model, **payload}
+    request = urllib.request.Request(
+        f"{base_url(args)}/v1/completions",
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=600) as response:
+        result = json.loads(response.read())
+    if not isinstance(result, dict):
+        raise ValueError("completion response is not a JSON object")
+    return result
+
+
+def extract_gsm8k_answer(text: str) -> str | None:
+    matches = re.findall(r"-?\d+(?:,\d{3})*(?:\.\d+)?", text)
+    return matches[-1].replace(",", "") if matches else None
+
+
+def evaluate_gsm8k(args: argparse.Namespace) -> dict[str, Any]:
+    from datasets import load_dataset
+
+    dataset = load_dataset("openai/gsm8k", "main", split="test")
+    limit = min(args.gsm8k_limit, len(dataset))
+    correct = 0
+    invalid = 0
+    for item in dataset.select(range(limit)):
+        prompt = f"Question: {item['question']}\nAnswer: Let's think step by step."
+        response = post_completion(
+            args,
+            {
+                "prompt": prompt,
+                "temperature": 0,
+                "max_tokens": args.gsm8k_max_tokens,
+                "stop": ["Question:"],
+                "seed": args.seed,
+            },
+        )
+        prediction = extract_gsm8k_answer(response["choices"][0]["text"])
+        expected = extract_gsm8k_answer(item["answer"])
+        invalid += prediction is None
+        correct += prediction is not None and prediction == expected
+    return {
+        "accuracy": correct / limit if limit else None,
+        "correct": correct,
+        "invalid": invalid,
+        "num_questions": limit,
+        "max_tokens": args.gsm8k_max_tokens,
+    }
+
+
+def evaluate_wikitext(args: argparse.Namespace) -> dict[str, Any]:
+    from datasets import load_dataset
+
+    dataset = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="test")
+    texts = [text.strip() for text in dataset["text"] if text.strip()]
+    total_nll = 0.0
+    total_words = 0
+    evaluated = 0
+    for text in texts:
+        words = text.split()
+        if len(words) < 2:
+            continue
+        prompt = " ".join(words[: args.wikitext_max_words])
+        response = post_completion(
+            args,
+            {
+                "prompt": prompt,
+                "temperature": 0,
+                "max_tokens": 1,
+                "echo": True,
+                "logprobs": 1,
+            },
+        )
+        choice = response["choices"][0]
+        token_logprobs = choice.get("logprobs", {}).get("token_logprobs", [])
+        completion_tokens = as_int(response.get("usage", {}).get("completion_tokens"))
+        if completion_tokens:
+            token_logprobs = token_logprobs[:-completion_tokens]
+        valid_logprobs = [
+            float(logprob) for logprob in token_logprobs if logprob is not None
+        ]
+        if not valid_logprobs:
+            raise ValueError("completion response has no prompt token logprobs")
+        total_nll -= sum(valid_logprobs)
+        total_words += len(prompt.split())
+        evaluated += 1
+        if evaluated == args.wikitext_limit:
+            break
+    if not total_words or evaluated != args.wikitext_limit:
+        raise ValueError(
+            f"evaluated {evaluated} WikiText samples; expected {args.wikitext_limit}"
+        )
+    return {
+        "word_perplexity": math.exp(total_nll / total_words),
+        "num_samples": evaluated,
+        "num_words": total_words,
+        "max_words_per_sample": args.wikitext_max_words,
+    }
+
+
+def run_quality_evaluation(
+    args: argparse.Namespace,
+    artifacts: RunArtifacts,
+) -> None:
+    for evaluator, output_path in (
+        (evaluate_gsm8k, Path(artifacts.gsm8k_json)),
+        (evaluate_wikitext, Path(artifacts.wikitext_json)),
+    ):
+        try:
+            result = evaluator(args)
+        except Exception as exc:
+            result = {"error": f"{type(exc).__name__}: {exc}"}
+        write_json(output_path, result)
+
+
 def terminate_process(proc: subprocess.Popen[str], timeout_s: float) -> None:
     if proc.poll() is not None:
         return
@@ -687,12 +867,20 @@ def terminate_process(proc: subprocess.Popen[str], timeout_s: float) -> None:
 
 def summarize_run(
     args: argparse.Namespace,
+    runner: str,
     label: str,
     enabled: bool,
     artifacts: RunArtifacts,
 ) -> RunSummary:
     benchmark = load_json(Path(artifacts.benchmark_json))
-    validation_errors = validate_artifacts(artifacts, benchmark)
+    gsm8k = load_json(Path(artifacts.gsm8k_json))
+    wikitext = load_json(Path(artifacts.wikitext_json))
+    validation_errors = validate_artifacts(
+        artifacts,
+        benchmark,
+        expected_completed=args.num_prompts,
+        quality_required=not args.skip_quality,
+    )
     memory_stats = load_memory_stats(Path(artifacts.nvidia_smi_csv))
     peak_usage = load_peak_kv_usage(Path(artifacts.metrics_jsonl))
     capacity_tokens = parse_kv_cache_capacity_tokens(Path(artifacts.server_log))
@@ -710,8 +898,15 @@ def summarize_run(
     peak_benchmark_memory = memory_stats.get("peak_benchmark")
 
     return RunSummary(
+        runner=runner,
         label=label,
         paged_eviction_enabled=enabled,
+        completion_status=(
+            "complete"
+            if as_int(benchmark.get("completed")) == args.num_prompts
+            and as_int(benchmark.get("failed")) == 0
+            else "invalid"
+        ),
         artifacts=artifacts,
         completed=as_int(benchmark.get("completed")),
         failed=as_int(benchmark.get("failed")),
@@ -735,19 +930,36 @@ def summarize_run(
         kv_cache_capacity_bytes=capacity_bytes,
         peak_kv_cache_usage_fraction=peak_usage,
         derived_peak_kv_cache_bytes=derived_peak_kv,
+        gsm8k_accuracy=as_float(gsm8k.get("accuracy")),
+        wikitext_word_perplexity=as_float(wikitext.get("word_perplexity")),
+        validation_passed=not validation_errors,
         validation_errors=validation_errors,
     )
 
 
-def validate_artifacts(artifacts: RunArtifacts, benchmark: dict[str, Any]) -> list[str]:
+def validate_artifacts(
+    artifacts: RunArtifacts,
+    benchmark: dict[str, Any],
+    expected_completed: int,
+    quality_required: bool,
+) -> list[str]:
     errors: list[str] = []
-    for label, path_str in {
+    required_artifacts = {
         "server log": artifacts.server_log,
         "benchmark log": artifacts.benchmark_log,
         "benchmark json": artifacts.benchmark_json,
         "nvidia-smi csv": artifacts.nvidia_smi_csv,
         "metrics jsonl": artifacts.metrics_jsonl,
-    }.items():
+        "commands json": artifacts.command_json,
+    }
+    if quality_required:
+        required_artifacts.update(
+            {
+                "GSM8K json": artifacts.gsm8k_json,
+                "WikiText json": artifacts.wikitext_json,
+            }
+        )
+    for label, path_str in required_artifacts.items():
         path = Path(path_str)
         if not path.exists():
             errors.append(f"missing {label}: {path}")
@@ -758,11 +970,35 @@ def validate_artifacts(artifacts: RunArtifacts, benchmark: dict[str, Any]) -> li
     if not isinstance(ttfts, list) or not ttfts:
         errors.append("benchmark JSON has no non-empty ttfts array")
 
+    completed = as_int(benchmark.get("completed"))
+    failed = as_int(benchmark.get("failed"))
+    if completed != expected_completed:
+        errors.append(
+            f"benchmark completed {completed!r} requests; expected {expected_completed}"
+        )
+    if failed != 0:
+        errors.append(f"benchmark failed count is {failed!r}; expected 0")
+
     if not has_memory_samples(Path(artifacts.nvidia_smi_csv)):
         errors.append("nvidia-smi CSV has no successful memory samples")
 
     if load_peak_kv_usage(Path(artifacts.metrics_jsonl)) is None:
         errors.append(f"metrics samples contain no {KV_CACHE_USAGE_METRIC} values")
+
+    server_log_path = Path(artifacts.server_log)
+    if server_log_path.exists():
+        server_log = server_log_path.read_text(encoding="utf-8", errors="replace")
+        match = SERVER_ERROR_RE.search(server_log)
+        if match is not None:
+            errors.append(f"server log contains error marker: {match.group(0)!r}")
+
+    if quality_required:
+        gsm8k = load_json(Path(artifacts.gsm8k_json))
+        wikitext = load_json(Path(artifacts.wikitext_json))
+        if as_float(gsm8k.get("accuracy")) is None:
+            errors.append("GSM8K result has no accuracy metric")
+        if as_float(wikitext.get("word_perplexity")) is None:
+            errors.append("WikiText result has no word_perplexity metric")
 
     return errors
 
@@ -843,9 +1079,12 @@ def parse_prometheus_values(body: str, metric_name: str) -> list[float]:
 def write_summary(
     root_dir: Path,
     args: argparse.Namespace,
-    runs: dict[str, RunSummary],
+    runs: dict[str, dict[str, RunSummary]],
 ) -> None:
-    deltas = compute_deltas(runs["disabled"], runs["enabled"])
+    deltas = {
+        runner: compute_deltas(runner_runs["disabled"], runner_runs["enabled"])
+        for runner, runner_runs in runs.items()
+    }
     summary = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "output_dir": str(root_dir),
@@ -882,12 +1121,23 @@ def write_summary(
             },
             "bytes_per_kv_token": args.bytes_per_kv_token,
             "gpu_index": args.gpu_index,
+            "runners": selected_runners(args.runner),
+            "quality": {
+                "enabled": not args.skip_quality,
+                "gsm8k_limit": args.gsm8k_limit,
+                "gsm8k_max_tokens": args.gsm8k_max_tokens,
+                "wikitext_limit": args.wikitext_limit,
+                "wikitext_max_words": args.wikitext_max_words,
+            },
         },
-        "runs": {name: asdict(run) for name, run in runs.items()},
+        "runs": {
+            runner: {mode: asdict(run) for mode, run in runner_runs.items()}
+            for runner, runner_runs in runs.items()
+        },
         "deltas_enabled_vs_disabled_pct": deltas,
     }
     write_json(root_dir / "summary.json", summary)
-    write_summary_csv(root_dir / "summary.csv", runs, deltas)
+    write_summary_csv(root_dir / "summary.csv", runs)
 
 
 def compute_deltas(
@@ -904,24 +1154,34 @@ def compute_deltas(
 
 def write_summary_csv(
     path: Path,
-    runs: dict[str, RunSummary],
-    deltas: dict[str, float | None],
+    runs: dict[str, dict[str, RunSummary]],
 ) -> None:
     with path.open("w", newline="", encoding="utf-8") as file:
+        metric_names = summary_metric_names()
         writer = csv.DictWriter(
             file,
-            fieldnames=["metric", "disabled", "enabled", "delta_pct"],
+            fieldnames=[
+                "runner",
+                "eviction_mode",
+                "completion_status",
+                "validation_passed",
+                "validation_errors",
+                *metric_names,
+            ],
         )
         writer.writeheader()
-        for metric in summary_metric_names():
-            writer.writerow(
-                {
-                    "metric": metric,
-                    "disabled": getattr(runs["disabled"], metric),
-                    "enabled": getattr(runs["enabled"], metric),
-                    "delta_pct": deltas.get(metric),
-                }
-            )
+        for runner, runner_runs in runs.items():
+            for mode, run in runner_runs.items():
+                writer.writerow(
+                    {
+                        "runner": runner,
+                        "eviction_mode": mode,
+                        "completion_status": run.completion_status,
+                        "validation_passed": run.validation_passed,
+                        "validation_errors": "; ".join(run.validation_errors),
+                        **{metric: getattr(run, metric) for metric in metric_names},
+                    }
+                )
 
 
 def summary_metric_names() -> list[str]:
@@ -937,11 +1197,14 @@ def summary_metric_names() -> list[str]:
         "output_throughput",
         "total_token_throughput",
         "request_throughput",
+        "completed",
         "failed",
+        "gsm8k_accuracy",
+        "wikitext_word_perplexity",
     ]
 
 
-def print_terminal_table(runs: dict[str, RunSummary]) -> None:
+def print_terminal_table(runner: str, runs: dict[str, RunSummary]) -> None:
     disabled = runs["disabled"]
     enabled = runs["enabled"]
     rows = [
@@ -980,7 +1243,7 @@ def print_terminal_table(runs: dict[str, RunSummary]) -> None:
                 format_percent(percent_delta(as_float(base), as_float(new))),
             ]
         )
-    print()
+    print(f"\nRunner: {runner}")
     print(format_table(table))
 
     validation_errors = [
@@ -989,7 +1252,7 @@ def print_terminal_table(runs: dict[str, RunSummary]) -> None:
         for error in run.validation_errors
     ]
     if validation_errors:
-        print("\nValidation warnings:")
+        print("\nValidation errors:")
         for error in validation_errors:
             print(f"  - {error}")
 
@@ -1081,12 +1344,16 @@ def make_root_dir(args: argparse.Namespace) -> Path:
 
 
 def print_dry_run(root_dir: Path, args: argparse.Namespace) -> None:
-    for label, enabled in (("disabled", False), ("enabled", True)):
-        run_dir = root_dir / label
-        print(f"\n[{label}] server:")
-        print(shlex.join(build_server_command(args, enabled)))
-        print(f"[{label}] benchmark:")
-        print(shlex.join(build_benchmark_command(args, run_dir, label)))
+    for runner in selected_runners(args.runner):
+        for label, enabled in (("disabled", False), ("enabled", True)):
+            run_dir = root_dir / runner / label
+            print(
+                f"\n[{runner}/{label}] "
+                f"VLLM_USE_V2_MODEL_RUNNER={RUNNER_ENV[runner]} server:"
+            )
+            print(shlex.join(build_server_command(args, enabled)))
+            print(f"[{runner}/{label}] benchmark:")
+            print(shlex.join(build_benchmark_command(args, run_dir, label)))
     print(f"\nArtifacts would be written under {root_dir}")
 
 
@@ -1095,25 +1362,38 @@ def main() -> int:
     root_dir = make_root_dir(args)
     root_dir.mkdir(parents=True, exist_ok=True)
 
+    runners = selected_runners(args.runner)
     if args.dry_run:
         print_dry_run(root_dir, args)
         runs = {
-            "disabled": run_one(args, root_dir, "disabled", enabled=False),
-            "enabled": run_one(args, root_dir, "enabled", enabled=True),
+            runner: {
+                "disabled": run_one(args, root_dir, runner, "disabled", enabled=False),
+                "enabled": run_one(args, root_dir, runner, "enabled", enabled=True),
+            }
+            for runner in runners
         }
         write_summary(root_dir, args, runs)
         return 0
 
     print(f"Writing artifacts to {root_dir}")
-    runs = {
-        "disabled": run_one(args, root_dir, "disabled", enabled=False),
-        "enabled": run_one(args, root_dir, "enabled", enabled=True),
-    }
+    runs = {}
+    for runner in runners:
+        runs[runner] = {
+            "disabled": run_one(args, root_dir, runner, "disabled", enabled=False),
+            "enabled": run_one(args, root_dir, runner, "enabled", enabled=True),
+        }
     write_summary(root_dir, args, runs)
-    print_terminal_table(runs)
+    for runner, runner_runs in runs.items():
+        print_terminal_table(runner, runner_runs)
     print(f"\nsummary: {root_dir / 'summary.json'}")
     print(f"csv:     {root_dir / 'summary.csv'}")
-    return 0
+    return int(
+        any(
+            run.validation_errors
+            for runner_runs in runs.values()
+            for run in runner_runs.values()
+        )
+    )
 
 
 if __name__ == "__main__":

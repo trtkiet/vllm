@@ -27,9 +27,9 @@ from vllm.v1.request import Request, RequestStatus
 pytestmark = pytest.mark.cpu_test
 
 
-def make_manager(block_size: int = 4) -> KVCacheManager:
+def make_manager(block_size: int = 4, num_blocks: int = 8) -> KVCacheManager:
     kv_cache_config = KVCacheConfig(
-        num_blocks=8,
+        num_blocks=num_blocks,
         kv_cache_tensors=[],
         kv_cache_groups=[
             KVCacheGroupSpec(
@@ -52,9 +52,9 @@ def make_manager(block_size: int = 4) -> KVCacheManager:
     )
 
 
-def make_request() -> Request:
+def make_request(request_id: str = "request") -> Request:
     return Request(
-        request_id="request",
+        request_id=request_id,
         prompt_token_ids=list(range(8)),
         sampling_params=SamplingParams(max_tokens=32),
         pooling_params=None,
@@ -168,6 +168,72 @@ def test_scheduler_rejects_multiple_kv_cache_groups():
 
     with pytest.raises(ValueError, match="exactly one full-attention"):
         scheduler._validate_paged_eviction_kv_cache()
+
+
+def test_scheduler_computes_safe_concurrency_cap():
+    scheduler = object.__new__(Scheduler)
+    scheduler.block_size = 4
+    scheduler.kv_cache_manager = make_manager(block_size=4, num_blocks=10)
+    scheduler.paged_eviction_config = PagedEvictionConfig(cache_budget_tokens=8)
+
+    scheduler._initialize_paged_eviction_capacity()
+
+    # One block is reserved as the null block. Each active request reserves
+    # two budget blocks and one temporary decode block.
+    assert scheduler.paged_eviction_max_running_reqs == 3
+
+
+def test_scheduler_rejects_insufficient_paged_eviction_capacity():
+    scheduler = object.__new__(Scheduler)
+    scheduler.block_size = 4
+    scheduler.kv_cache_manager = make_manager(block_size=4, num_blocks=3)
+    scheduler.paged_eviction_config = PagedEvictionConfig(cache_budget_tokens=8)
+
+    with pytest.raises(ValueError, match="one cache budget plus one temporary block"):
+        scheduler._initialize_paged_eviction_capacity()
+
+
+def test_scheduler_stops_admitting_at_paged_eviction_capacity():
+    scheduler = object.__new__(Scheduler)
+    scheduler.block_size = 4
+    scheduler.kv_cache_manager = make_manager(block_size=4, num_blocks=7)
+    scheduler.paged_eviction_config = PagedEvictionConfig(cache_budget_tokens=8)
+    scheduler._initialize_paged_eviction_capacity()
+    scheduler.running = [make_request("0"), make_request("1")]
+
+    assert scheduler.paged_eviction_max_running_reqs == 2
+    assert scheduler._paged_eviction_capacity_reached()
+
+
+def test_concurrency_cap_reserves_partial_block_decode_headroom():
+    scheduler = object.__new__(Scheduler)
+    scheduler.block_size = 4
+    scheduler.kv_cache_manager = make_manager(block_size=4, num_blocks=7)
+    scheduler.paged_eviction_config = PagedEvictionConfig(cache_budget_tokens=8)
+    scheduler._initialize_paged_eviction_capacity()
+    requests = [make_request("0"), make_request("1")]
+
+    for request in requests:
+        assert (
+            scheduler.kv_cache_manager.allocate_slots(
+                request,
+                num_new_tokens=8,
+                num_required_tokens=8,
+            )
+            is not None
+        )
+        request.num_computed_tokens = 8
+
+    # Both requests can cross a block boundary concurrently without pressure.
+    for request in requests:
+        assert (
+            scheduler.kv_cache_manager.allocate_slots(
+                request,
+                num_new_tokens=1,
+                num_required_tokens=9,
+            )
+            is not None
+        )
 
 
 def test_resident_allocation_does_not_recreate_evicted_logical_capacity():
