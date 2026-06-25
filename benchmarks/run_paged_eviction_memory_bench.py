@@ -32,10 +32,13 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable
+from contextlib import AbstractContextManager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from tqdm.auto import tqdm
 
 MODEL = "meta-llama/Llama-3.1-8B"
 BYTES_PER_KV_TOKEN_LLAMA_3_1_8B = 32 * 2 * 8 * 128 * 2
@@ -46,6 +49,8 @@ SERVER_ERROR_RE = re.compile(
     r"\bRuntimeError:|[Uu]ncaught (?:runtime )?[Ee]xception)"
 )
 RUNNER_ENV = {"legacy": "0", "v2": "1"}
+# Matches vllm.config.cache.CacheConfig.DEFAULT_BLOCK_SIZE.
+DEFAULT_KV_CACHE_BLOCK_SIZE = 16
 
 
 @dataclass
@@ -87,6 +92,7 @@ class RunSummary:
     peak_kv_cache_usage_fraction: float | None
     derived_peak_kv_cache_bytes: float | None
     gsm8k_accuracy: float | None
+    wikitext_continuation_f1: float | None
     wikitext_word_perplexity: float | None
     validation_passed: bool
     validation_errors: list[str]
@@ -291,9 +297,15 @@ class MetricsSampler:
             self.stop_event.wait(self.interval_s)
 
 
-def parse_args() -> argparse.Namespace:
+def build_arg_parser(
+    *,
+    description: str | None = None,
+    default_results_dir: Path = Path("benchmarks/results/paged_eviction"),
+    include_block_size: bool = True,
+) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description=(
+        description=description
+        or (
             "Run disabled/enabled PagedEviction serving benchmarks and collect "
             "GPU memory, vLLM metrics, and benchmark latency artifacts."
         )
@@ -310,6 +322,16 @@ def parse_args() -> argparse.Namespace:
     server.add_argument("--max-num-seqs", type=int, default=64)
     server.add_argument("--max-num-batched-tokens", type=int, default=8192)
     server.add_argument("--gpu-memory-utilization", type=float, default=0.9)
+    if include_block_size:
+        server.add_argument(
+            "--block-size",
+            type=int,
+            default=None,
+            help=(
+                "Physical KV cache block size in tokens. If omitted, vLLM "
+                f"uses its current default ({DEFAULT_KV_CACHE_BLOCK_SIZE})."
+            ),
+        )
     server.add_argument(
         "--quantization",
         default="fp8",
@@ -335,6 +357,11 @@ def parse_args() -> argparse.Namespace:
     workload.add_argument("--max-concurrency", type=int, default=64)
     workload.add_argument("--seed", type=int, default=0)
     workload.add_argument(
+        "--skip-serving-benchmark",
+        action="store_true",
+        help="Skip the synthetic serving benchmark and only run quality checks.",
+    )
+    workload.add_argument(
         "--smoke",
         action="store_true",
         help=(
@@ -353,12 +380,18 @@ def parse_args() -> argparse.Namespace:
     quality.add_argument("--gsm8k-max-tokens", type=int, default=2048)
     quality.add_argument("--wikitext-limit", type=int, default=4)
     quality.add_argument("--wikitext-max-words", type=int, default=256)
+    quality.add_argument("--wikitext-continuation-words", type=int, default=64)
+    quality.add_argument(
+        "--skip-wikitext-continuation",
+        action="store_true",
+        help="Skip WikiText continuation F1 and only measure perplexity.",
+    )
 
     artifacts = parser.add_argument_group("artifacts")
     artifacts.add_argument(
         "--results-dir",
         type=Path,
-        default=Path("benchmarks/results/paged_eviction"),
+        default=default_results_dir,
     )
     artifacts.add_argument(
         "--timestamp",
@@ -389,7 +422,12 @@ def parse_args() -> argparse.Namespace:
         help="Print commands and planned output paths without starting servers.",
     )
 
-    args = parser.parse_args()
+    return parser
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
     if args.quantization.lower() in ("", "none"):
         args.quantization = None
     if args.smoke:
@@ -452,6 +490,8 @@ def build_server_command(args: argparse.Namespace, enabled: bool) -> list[str]:
     ]
     if args.quantization is not None:
         command.extend(["--quantization", args.quantization])
+    if getattr(args, "block_size", None) is not None:
+        command.extend(["--block-size", str(args.block_size)])
     if enabled:
         command.extend(
             [
@@ -543,6 +583,10 @@ def run_one(
     runner: str,
     label: str,
     enabled: bool,
+    *,
+    show_progress: bool = False,
+    progress_label: str | None = None,
+    progress_position: int = 1,
 ) -> RunSummary:
     run_dir = root_dir / runner / label
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -568,11 +612,23 @@ def run_one(
             "environment": {"VLLM_USE_V2_MODEL_RUNNER": RUNNER_ENV[runner]},
             "runner": runner,
             "paged_eviction_enabled": enabled,
+            "block_size": getattr(args, "block_size", None),
+            "skip_serving_benchmark": getattr(args, "skip_serving_benchmark", False),
         },
     )
 
     if args.dry_run:
         return empty_summary(runner, label, enabled, artifacts)
+
+    phase_progress = None
+    if show_progress:
+        phase_progress = tqdm(
+            total=run_phase_count(args),
+            desc=progress_label or f"{runner}/{label}",
+            unit="phase",
+            leave=False,
+            position=progress_position,
+        )
 
     phase = Phase("idle")
     memory_sampler = NvidiaSmiSampler(
@@ -585,8 +641,13 @@ def run_one(
     server_proc: subprocess.Popen[str] | None = None
 
     try:
-        memory_sampler.sample_now("idle")
+        set_run_phase_progress(phase_progress, "idle")
+        with detail_progress(phase_progress, "idle sample", total=1) as detail:
+            memory_sampler.sample_now("idle")
+            advance_progress(detail)
+        advance_run_phase_progress(phase_progress)
         phase.set("startup")
+        set_run_phase_progress(phase_progress, "startup")
         memory_sampler.start()
         assert_port_available(args)
 
@@ -600,7 +661,16 @@ def run_one(
                 env=server_environment(runner),
             )
 
-            wait_for_health(args, server_proc, Path(artifacts.server_log))
+            with detail_progress(
+                phase_progress, "startup health", unit="poll"
+            ) as detail:
+                wait_for_health(
+                    args,
+                    server_proc,
+                    Path(artifacts.server_log),
+                    progress=detail,
+                )
+            advance_run_phase_progress(phase_progress)
 
             metrics_sampler = MetricsSampler(
                 base_url(args),
@@ -611,29 +681,128 @@ def run_one(
             metrics_sampler.start()
 
             phase.set("post_load")
-            memory_sampler.sample_now("post_load")
-            metrics_sampler.sample_now("post_load")
-            time.sleep(args.post_load_sleep_s)
+            set_run_phase_progress(phase_progress, "post_load")
+            with detail_progress(
+                phase_progress,
+                "post-load",
+                total=2 + max(args.post_load_sleep_s, 0.0),
+            ) as detail:
+                memory_sampler.sample_now("post_load")
+                advance_progress(detail)
+                metrics_sampler.sample_now("post_load")
+                advance_progress(detail)
+                sleep_with_progress(args.post_load_sleep_s, detail)
+            advance_run_phase_progress(phase_progress)
 
-            phase.set("benchmark")
-            run_benchmark(benchmark_command, Path(artifacts.benchmark_log))
+            if not args.skip_serving_benchmark:
+                phase.set("benchmark")
+                set_run_phase_progress(phase_progress, "benchmark")
+                with detail_progress(
+                    phase_progress, "benchmark elapsed", unit="s"
+                ) as detail:
+                    run_benchmark(
+                        benchmark_command,
+                        Path(artifacts.benchmark_log),
+                        progress=detail,
+                    )
+                advance_run_phase_progress(phase_progress)
 
             if not args.skip_quality:
                 phase.set("quality")
-                run_quality_evaluation(args, artifacts)
+                set_run_phase_progress(phase_progress, "quality")
+                with detail_progress(
+                    phase_progress,
+                    "quality samples",
+                    total=args.gsm8k_limit + args.wikitext_limit,
+                    unit="sample",
+                ) as detail:
+                    run_quality_evaluation(args, artifacts, progress=detail)
+                advance_run_phase_progress(phase_progress)
 
             phase.set("post_bench")
-            memory_sampler.sample_now("post_bench")
-            metrics_sampler.sample_now("post_bench")
+            set_run_phase_progress(phase_progress, "post_bench")
+            with detail_progress(
+                phase_progress,
+                "post-bench sample",
+                total=2,
+            ) as detail:
+                memory_sampler.sample_now("post_bench")
+                advance_progress(detail)
+                metrics_sampler.sample_now("post_bench")
+                advance_progress(detail)
+            advance_run_phase_progress(phase_progress)
     finally:
+        set_run_phase_progress(phase_progress, "shutdown")
         if metrics_sampler is not None:
             metrics_sampler.stop()
         if server_proc is not None:
             terminate_process(server_proc, args.shutdown_timeout_s)
-            wait_for_health_down(args, timeout_s=30.0)
+            with detail_progress(
+                phase_progress, "shutdown health", unit="poll"
+            ) as detail:
+                wait_for_health_down(args, timeout_s=30.0, progress=detail)
         memory_sampler.stop()
+        advance_run_phase_progress(phase_progress)
+        if phase_progress is not None:
+            phase_progress.close()
 
     return summarize_run(args, runner, label, enabled, artifacts)
+
+
+def run_phase_count(args: argparse.Namespace) -> int:
+    total = 5
+    if not args.skip_serving_benchmark:
+        total += 1
+    if not args.skip_quality:
+        total += 1
+    return total
+
+
+def set_run_phase_progress(progress: tqdm | None, phase: str) -> None:
+    if progress is not None:
+        progress.set_postfix(phase=phase, refresh=True)
+
+
+def advance_run_phase_progress(progress: tqdm | None) -> None:
+    if progress is not None:
+        progress.update()
+
+
+def detail_progress(
+    parent: tqdm | None,
+    desc: str,
+    *,
+    total: float | None = None,
+    unit: str = "step",
+) -> AbstractContextManager[tqdm | None]:
+    if parent is None:
+        return contextlib.nullcontext(None)
+    return tqdm(
+        total=total,
+        desc=f"  {desc}",
+        unit=unit,
+        leave=False,
+        position=2,
+    )
+
+
+def advance_progress(progress: tqdm | None, amount: float = 1) -> None:
+    if progress is not None:
+        progress.update(amount)
+
+
+def set_detail_postfix(progress: tqdm | None, **values: Any) -> None:
+    if progress is not None:
+        progress.set_postfix(**values, refresh=True)
+
+
+def sleep_with_progress(duration_s: float, progress: tqdm | None) -> None:
+    remaining = max(duration_s, 0.0)
+    while remaining > 0:
+        interval = min(remaining, 0.5)
+        time.sleep(interval)
+        advance_progress(progress, interval)
+        remaining -= interval
 
 
 def empty_summary(
@@ -667,6 +836,7 @@ def empty_summary(
         peak_kv_cache_usage_fraction=None,
         derived_peak_kv_cache_bytes=None,
         gsm8k_accuracy=None,
+        wikitext_continuation_f1=None,
         wikitext_word_perplexity=None,
         validation_passed=True,
         validation_errors=[],
@@ -677,6 +847,7 @@ def wait_for_health(
     args: argparse.Namespace,
     proc: subprocess.Popen[str],
     server_log_path: Path,
+    progress: tqdm | None = None,
 ) -> None:
     deadline = time.monotonic() + args.startup_timeout_s
     url = health_url(args)
@@ -695,6 +866,7 @@ def wait_for_health(
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             last_error = str(exc)
         time.sleep(2)
+        advance_progress(progress)
 
     raise TimeoutError(
         f"Timed out after {args.startup_timeout_s:.0f}s waiting for {url}. "
@@ -702,7 +874,11 @@ def wait_for_health(
     )
 
 
-def wait_for_health_down(args: argparse.Namespace, timeout_s: float) -> None:
+def wait_for_health_down(
+    args: argparse.Namespace,
+    timeout_s: float,
+    progress: tqdm | None = None,
+) -> None:
     deadline = time.monotonic() + timeout_s
     url = health_url(args)
     while time.monotonic() < deadline:
@@ -710,20 +886,29 @@ def wait_for_health_down(args: argparse.Namespace, timeout_s: float) -> None:
             with urllib.request.urlopen(url, timeout=2) as response:
                 if 200 <= response.status < 300:
                     time.sleep(1)
+                    advance_progress(progress)
                     continue
         except (urllib.error.URLError, TimeoutError, OSError):
             return
         time.sleep(1)
+        advance_progress(progress)
 
 
-def run_benchmark(command: list[str], log_path: Path) -> None:
+def run_benchmark(
+    command: list[str],
+    log_path: Path,
+    progress: tqdm | None = None,
+) -> None:
     with log_path.open("w", encoding="utf-8") as log_file:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             command,
             stdout=log_file,
             stderr=subprocess.STDOUT,
             text=True,
         )
+        while proc.poll() is None:
+            time.sleep(1)
+            advance_progress(progress)
     if proc.returncode != 0:
         raise RuntimeError(
             f"Benchmark command failed with code {proc.returncode}. "
@@ -753,15 +938,46 @@ def extract_gsm8k_answer(text: str) -> str | None:
     return matches[-1].replace(",", "") if matches else None
 
 
-def evaluate_gsm8k(args: argparse.Namespace) -> dict[str, Any]:
+def tokenize_quality_filter(args: argparse.Namespace) -> Any | None:
+    if getattr(args, "quality_min_prompt_budget_tokens", None) is None:
+        return None
+    from transformers import AutoTokenizer
+
+    return AutoTokenizer.from_pretrained(args.model)
+
+
+def prompt_fits_quality_budget(
+    args: argparse.Namespace,
+    prompt: str,
+    tokenizer: Any | None,
+) -> bool:
+    min_budget = getattr(args, "quality_min_prompt_budget_tokens", None)
+    if min_budget is None or tokenizer is None:
+        return True
+    block_size = (
+        getattr(args, "quality_block_size", None) or DEFAULT_KV_CACHE_BLOCK_SIZE
+    )
+    token_count = len(tokenizer(prompt, add_special_tokens=False).input_ids)
+    rounded_tokens = math.ceil(token_count / block_size) * block_size
+    return rounded_tokens <= min_budget
+
+
+def evaluate_gsm8k(
+    args: argparse.Namespace,
+    progress: tqdm | None = None,
+) -> dict[str, Any]:
     from datasets import load_dataset
 
     dataset = load_dataset("openai/gsm8k", "main", split="test")
-    limit = min(args.gsm8k_limit, len(dataset))
+    tokenizer = tokenize_quality_filter(args)
     correct = 0
     invalid = 0
-    for item in dataset.select(range(limit)):
+    evaluated = 0
+    samples = []
+    for sample_index, item in enumerate(dataset):
         prompt = f"Question: {item['question']}\nAnswer: Let's think step by step."
+        if not prompt_fits_quality_budget(args, prompt, tokenizer):
+            continue
         response = post_completion(
             args,
             {
@@ -775,29 +991,94 @@ def evaluate_gsm8k(args: argparse.Namespace) -> dict[str, Any]:
         prediction = extract_gsm8k_answer(response["choices"][0]["text"])
         expected = extract_gsm8k_answer(item["answer"])
         invalid += prediction is None
-        correct += prediction is not None and prediction == expected
+        is_correct = prediction is not None and prediction == expected
+        correct += is_correct
+        samples.append(
+            {
+                "sample_index": sample_index,
+                "prediction": prediction,
+                "expected": expected,
+                "correct": is_correct,
+            }
+        )
+        evaluated += 1
+        set_detail_postfix(progress, evaluator="gsm8k", sample=evaluated)
+        advance_progress(progress)
+        if evaluated == args.gsm8k_limit:
+            break
+    if evaluated != args.gsm8k_limit:
+        raise ValueError(
+            f"evaluated {evaluated} GSM8K samples; expected {args.gsm8k_limit}"
+        )
     return {
-        "accuracy": correct / limit if limit else None,
+        "accuracy": correct / evaluated if evaluated else None,
         "correct": correct,
         "invalid": invalid,
-        "num_questions": limit,
+        "num_questions": evaluated,
         "max_tokens": args.gsm8k_max_tokens,
+        "sample_indices": [sample["sample_index"] for sample in samples],
+        "samples": samples,
     }
 
 
-def evaluate_wikitext(args: argparse.Namespace) -> dict[str, Any]:
+def word_tokens(text: str) -> list[str]:
+    return re.findall(r"\w+", text.lower())
+
+
+def word_overlap_f1(prediction: str, reference: str) -> float:
+    pred_tokens = word_tokens(prediction)
+    ref_tokens = word_tokens(reference)
+    if not pred_tokens or not ref_tokens:
+        return 0.0
+    ref_counts: dict[str, int] = {}
+    for token in ref_tokens:
+        ref_counts[token] = ref_counts.get(token, 0) + 1
+    overlap = 0
+    for token in pred_tokens:
+        count = ref_counts.get(token, 0)
+        if count:
+            overlap += 1
+            ref_counts[token] = count - 1
+    if overlap == 0:
+        return 0.0
+    precision = overlap / len(pred_tokens)
+    recall = overlap / len(ref_tokens)
+    return 2 * precision * recall / (precision + recall)
+
+
+def evaluate_wikitext(
+    args: argparse.Namespace,
+    progress: tqdm | None = None,
+) -> dict[str, Any]:
     from datasets import load_dataset
 
     dataset = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="test")
-    texts = [text.strip() for text in dataset["text"] if text.strip()]
+    texts = [
+        (sample_index, text.strip())
+        for sample_index, text in enumerate(dataset["text"])
+        if text.strip()
+    ]
+    tokenizer = tokenize_quality_filter(args)
     total_nll = 0.0
     total_words = 0
+    total_f1 = 0.0
     evaluated = 0
-    for text in texts:
+    sample_indices = []
+    skip_continuation = getattr(args, "skip_wikitext_continuation", False)
+    for sample_index, text in texts:
         words = text.split()
-        if len(words) < 2:
+        prefix_words = words[: args.wikitext_max_words]
+        continuation_words: list[str] = []
+        if not skip_continuation:
+            continuation_words = words[
+                args.wikitext_max_words : args.wikitext_max_words
+                + args.wikitext_continuation_words
+            ]
+        if not prefix_words or (not skip_continuation and not continuation_words):
             continue
-        prompt = " ".join(words[: args.wikitext_max_words])
+        prompt = " ".join(prefix_words)
+        if not prompt_fits_quality_budget(args, prompt, tokenizer):
+            continue
         response = post_completion(
             args,
             {
@@ -820,31 +1101,55 @@ def evaluate_wikitext(args: argparse.Namespace) -> dict[str, Any]:
             raise ValueError("completion response has no prompt token logprobs")
         total_nll -= sum(valid_logprobs)
         total_words += len(prompt.split())
+        sample_indices.append(sample_index)
+
+        if not skip_continuation:
+            continuation_response = post_completion(
+                args,
+                {
+                    "prompt": prompt,
+                    "temperature": 0,
+                    "max_tokens": args.wikitext_continuation_words,
+                    "seed": args.seed,
+                },
+            )
+            prediction = continuation_response["choices"][0]["text"]
+            reference = " ".join(continuation_words)
+            total_f1 += word_overlap_f1(prediction, reference)
+
         evaluated += 1
+        set_detail_postfix(progress, evaluator="wikitext", sample=evaluated)
+        advance_progress(progress)
         if evaluated == args.wikitext_limit:
             break
     if not total_words or evaluated != args.wikitext_limit:
         raise ValueError(
             f"evaluated {evaluated} WikiText samples; expected {args.wikitext_limit}"
         )
-    return {
+    result = {
         "word_perplexity": math.exp(total_nll / total_words),
         "num_samples": evaluated,
         "num_words": total_words,
         "max_words_per_sample": args.wikitext_max_words,
+        "continuation_words_per_sample": args.wikitext_continuation_words,
+        "sample_indices": sample_indices,
     }
+    if not skip_continuation:
+        result["continuation_f1"] = total_f1 / evaluated if evaluated else None
+    return result
 
 
 def run_quality_evaluation(
     args: argparse.Namespace,
     artifacts: RunArtifacts,
+    progress: tqdm | None = None,
 ) -> None:
     for evaluator, output_path in (
         (evaluate_gsm8k, Path(artifacts.gsm8k_json)),
         (evaluate_wikitext, Path(artifacts.wikitext_json)),
     ):
         try:
-            result = evaluator(args)
+            result = evaluator(args, progress=progress)
         except Exception as exc:
             result = {"error": f"{type(exc).__name__}: {exc}"}
         write_json(output_path, result)
@@ -879,7 +1184,11 @@ def summarize_run(
         artifacts,
         benchmark,
         expected_completed=args.num_prompts,
+        serving_required=not getattr(args, "skip_serving_benchmark", False),
         quality_required=not args.skip_quality,
+        wikitext_continuation_required=not getattr(
+            args, "skip_wikitext_continuation", False
+        ),
     )
     memory_stats = load_memory_stats(Path(artifacts.nvidia_smi_csv))
     peak_usage = load_peak_kv_usage(Path(artifacts.metrics_jsonl))
@@ -903,8 +1212,7 @@ def summarize_run(
         paged_eviction_enabled=enabled,
         completion_status=(
             "complete"
-            if as_int(benchmark.get("completed")) == args.num_prompts
-            and as_int(benchmark.get("failed")) == 0
+            if not validation_errors
             else "invalid"
         ),
         artifacts=artifacts,
@@ -931,6 +1239,7 @@ def summarize_run(
         peak_kv_cache_usage_fraction=peak_usage,
         derived_peak_kv_cache_bytes=derived_peak_kv,
         gsm8k_accuracy=as_float(gsm8k.get("accuracy")),
+        wikitext_continuation_f1=as_float(wikitext.get("continuation_f1")),
         wikitext_word_perplexity=as_float(wikitext.get("word_perplexity")),
         validation_passed=not validation_errors,
         validation_errors=validation_errors,
@@ -942,16 +1251,23 @@ def validate_artifacts(
     benchmark: dict[str, Any],
     expected_completed: int,
     quality_required: bool,
+    serving_required: bool = True,
+    wikitext_continuation_required: bool = True,
 ) -> list[str]:
     errors: list[str] = []
     required_artifacts = {
         "server log": artifacts.server_log,
-        "benchmark log": artifacts.benchmark_log,
-        "benchmark json": artifacts.benchmark_json,
-        "nvidia-smi csv": artifacts.nvidia_smi_csv,
-        "metrics jsonl": artifacts.metrics_jsonl,
         "commands json": artifacts.command_json,
     }
+    if serving_required:
+        required_artifacts.update(
+            {
+                "benchmark log": artifacts.benchmark_log,
+                "benchmark json": artifacts.benchmark_json,
+                "nvidia-smi csv": artifacts.nvidia_smi_csv,
+                "metrics jsonl": artifacts.metrics_jsonl,
+            }
+        )
     if quality_required:
         required_artifacts.update(
             {
@@ -966,24 +1282,28 @@ def validate_artifacts(
         elif path.stat().st_size == 0:
             errors.append(f"empty {label}: {path}")
 
-    ttfts = benchmark.get("ttfts")
-    if not isinstance(ttfts, list) or not ttfts:
-        errors.append("benchmark JSON has no non-empty ttfts array")
+    if serving_required:
+        ttfts = benchmark.get("ttfts")
+        if not isinstance(ttfts, list) or not ttfts:
+            errors.append("benchmark JSON has no non-empty ttfts array")
 
-    completed = as_int(benchmark.get("completed"))
-    failed = as_int(benchmark.get("failed"))
-    if completed != expected_completed:
-        errors.append(
-            f"benchmark completed {completed!r} requests; expected {expected_completed}"
-        )
-    if failed != 0:
-        errors.append(f"benchmark failed count is {failed!r}; expected 0")
+        completed = as_int(benchmark.get("completed"))
+        failed = as_int(benchmark.get("failed"))
+        if completed != expected_completed:
+            errors.append(
+                f"benchmark completed {completed!r} requests; "
+                f"expected {expected_completed}"
+            )
+        if failed != 0:
+            errors.append(f"benchmark failed count is {failed!r}; expected 0")
 
-    if not has_memory_samples(Path(artifacts.nvidia_smi_csv)):
-        errors.append("nvidia-smi CSV has no successful memory samples")
+        if not has_memory_samples(Path(artifacts.nvidia_smi_csv)):
+            errors.append("nvidia-smi CSV has no successful memory samples")
 
-    if load_peak_kv_usage(Path(artifacts.metrics_jsonl)) is None:
-        errors.append(f"metrics samples contain no {KV_CACHE_USAGE_METRIC} values")
+        if load_peak_kv_usage(Path(artifacts.metrics_jsonl)) is None:
+            errors.append(
+                f"metrics samples contain no {KV_CACHE_USAGE_METRIC} values"
+            )
 
     server_log_path = Path(artifacts.server_log)
     if server_log_path.exists():
@@ -997,6 +1317,11 @@ def validate_artifacts(
         wikitext = load_json(Path(artifacts.wikitext_json))
         if as_float(gsm8k.get("accuracy")) is None:
             errors.append("GSM8K result has no accuracy metric")
+        if (
+            wikitext_continuation_required
+            and as_float(wikitext.get("continuation_f1")) is None
+        ):
+            errors.append("WikiText result has no continuation_f1 metric")
         if as_float(wikitext.get("word_perplexity")) is None:
             errors.append("WikiText result has no word_perplexity metric")
 
@@ -1109,8 +1434,13 @@ def write_summary(
                 "tensor_parallel_size": 1,
                 "pipeline_parallel_size": 1,
                 "cache_budget_tokens": args.cache_budget_tokens,
+                "block_size": getattr(args, "block_size", None),
+                "assumed_default_block_size": DEFAULT_KV_CACHE_BLOCK_SIZE,
             },
             "workload": {
+                "serving_benchmark_enabled": not getattr(
+                    args, "skip_serving_benchmark", False
+                ),
                 "num_prompts": args.num_prompts,
                 "random_input_len": args.random_input_len,
                 "random_output_len": args.random_output_len,
@@ -1128,6 +1458,7 @@ def write_summary(
                 "gsm8k_max_tokens": args.gsm8k_max_tokens,
                 "wikitext_limit": args.wikitext_limit,
                 "wikitext_max_words": args.wikitext_max_words,
+                "wikitext_continuation_words": args.wikitext_continuation_words,
             },
         },
         "runs": {
@@ -1200,6 +1531,7 @@ def summary_metric_names() -> list[str]:
         "completed",
         "failed",
         "gsm8k_accuracy",
+        "wikitext_continuation_f1",
         "wikitext_word_perplexity",
     ]
 
