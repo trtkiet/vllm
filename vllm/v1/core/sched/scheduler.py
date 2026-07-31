@@ -369,11 +369,16 @@ class Scheduler(SchedulerInterface):
         return max_running_reqs is not None and len(self.running) >= max_running_reqs
 
     def _paged_eviction_required_tokens(
-        self, request_id: str, num_new_tokens: int
+        self,
+        request_id: str,
+        num_new_tokens: int,
+        num_computed_tokens: int | None = None,
     ) -> int | None:
         if not self.paged_eviction_enabled:
             return None
         state = self.paged_eviction_states[request_id]
+        if num_computed_tokens is not None:
+            state.resident_tokens = num_computed_tokens
         return state.resident_tokens + num_new_tokens
 
     def _mamba_block_aligned_split(
@@ -921,7 +926,9 @@ class Scheduler(SchedulerInterface):
                     reserved_blocks=reserved_blocks,
                     has_scheduled_reqs=bool(self.running),
                     num_required_tokens=self._paged_eviction_required_tokens(
-                        request.request_id, num_new_tokens
+                        request.request_id,
+                        num_new_tokens,
+                        num_computed_tokens=num_computed_tokens,
                     ),
                 )
 

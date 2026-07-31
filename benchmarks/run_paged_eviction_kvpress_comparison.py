@@ -36,7 +36,7 @@ from tqdm.auto import tqdm  # noqa: E402
 
 import benchmarks.run_paged_eviction_memory_bench as bench  # noqa: E402
 
-DEFAULT_BUDGETS = (256, 512, 1024, 2048, 4096)
+DEFAULT_BUDGETS = (64, 128, 256, 512, 1024)
 DEFAULT_KVPRESS_METHODS = (
     "KnormPress",
     "ExpectedAttentionPress",
@@ -88,6 +88,7 @@ class KvpressRun:
     latency_s: float | None
     peak_memory_mib: float | None
     gsm8k_accuracy: float | None
+    wikitext_continuation_f1: float | None
     wikitext_word_perplexity: float | None
     validation_errors: list[str]
 
@@ -127,7 +128,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     comparison.add_argument("--kvpress-device", default="auto")
     comparison.add_argument("--kvpress-dtype", default="auto")
-    comparison.add_argument("--kvpress-compression-interval", type=int, default=512)
+    comparison.add_argument("--kvpress-compression-interval", type=int, default=64)
     comparison.add_argument(
         "--kvpress-hidden-states-buffer-size",
         type=int,
@@ -140,6 +141,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=(
             "Transformers quantization for KVPress evaluations. Defaults to "
             "bitsandbytes 4-bit. Use 'none' to disable."
+        ),
+    )
+    comparison.add_argument(
+        "--quality-min-prompt-budget-tokens",
+        type=int,
+        default=None,
+        help=(
+            "Only evaluate quality samples whose prompt fits this many "
+            "block-aligned tokens. Defaults to the smallest retained-KV budget "
+            "so low-budget vLLM runs do not reject oversized prompts."
         ),
     )
     restrict_runner_to_single_default(parser)
@@ -163,7 +174,10 @@ def build_kvpress_eval_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gsm8k-max-tokens", type=int, default=2048)
     parser.add_argument("--wikitext-limit", type=int, default=4)
     parser.add_argument("--wikitext-max-words", type=int, default=256)
-    parser.add_argument("--min-prompt-budget-tokens", type=int, required=True)
+    parser.add_argument("--wikitext-continuation-words", type=int, default=64)
+    parser.add_argument("--skip-wikitext-continuation", action="store_true")
+    parser.add_argument("--skip-quality", action="store_true")
+    parser.add_argument("--min-prompt-budget-tokens", type=int, default=None)
     parser.add_argument("--block-size", type=int, required=True)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--dtype", default="auto")
@@ -186,7 +200,10 @@ def build_kvpress_batch_eval_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gsm8k-max-tokens", type=int, default=2048)
     parser.add_argument("--wikitext-limit", type=int, default=4)
     parser.add_argument("--wikitext-max-words", type=int, default=256)
-    parser.add_argument("--min-prompt-budget-tokens", type=int, required=True)
+    parser.add_argument("--wikitext-continuation-words", type=int, default=64)
+    parser.add_argument("--skip-wikitext-continuation", action="store_true")
+    parser.add_argument("--skip-quality", action="store_true")
+    parser.add_argument("--min-prompt-budget-tokens", type=int, default=None)
     parser.add_argument("--block-size", type=int, required=True)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--dtype", default="auto")
@@ -225,6 +242,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         args.kvpress_methods = parse_methods(args.kvpress_methods)
     except argparse.ArgumentTypeError as exc:
         parser.error(str(exc))
+    if args.quality_min_prompt_budget_tokens is None:
+        args.quality_min_prompt_budget_tokens = min(args.budgets)
+    if args.quality_min_prompt_budget_tokens <= 0:
+        parser.error("--quality-min-prompt-budget-tokens must be positive")
     if args.kvpress_methods == ["auto"]:
         args.kvpress_methods = discover_kvpress_methods()
         if not args.kvpress_methods and not args.skip_kvpress:
@@ -358,10 +379,9 @@ def paged_args_for_budget(
 ) -> argparse.Namespace:
     budget_args = argparse.Namespace(**vars(args))
     budget_args.cache_budget_tokens = budget or args.cache_budget_tokens
-    budget_args.quality_min_prompt_budget_tokens = min(args.budgets)
+    budget_args.quality_min_prompt_budget_tokens = args.quality_min_prompt_budget_tokens
     budget_args.quality_block_size = args.block_size
     budget_args.skip_serving_benchmark = True
-    budget_args.skip_wikitext_continuation = True
     return budget_args
 
 
@@ -430,7 +450,7 @@ def run_kvpress_batch(
     kvpress_root = root_dir / "kvpress"
     batch_dir = kvpress_root / "batch"
     batch_dir.mkdir(parents=True, exist_ok=True)
-    jobs = []
+    jobs: list[dict[str, Any]] = []
     artifacts_by_job: dict[tuple[str, int | None], KvpressArtifacts] = {}
     for method in [FULL_CACHE_METHOD, *args.kvpress_methods]:
         budgets = [None] if method == FULL_CACHE_METHOD else args.budgets
@@ -487,10 +507,13 @@ def run_kvpress_batch(
             stderr=subprocess.STDOUT,
             text=True,
         )
+        completed_job_indexes: set[int] = set()
         while proc.poll() is None:
             time.sleep(1)
+            update_completed_kvpress_jobs(jobs, completed_job_indexes, progress)
+        update_completed_kvpress_jobs(jobs, completed_job_indexes, progress)
 
-    for job in jobs:
+    for index, job in enumerate(jobs):
         method = str(job["method"])
         budget = job["budget_tokens"]
         assert budget is None or isinstance(budget, int)
@@ -503,9 +526,32 @@ def run_kvpress_batch(
             fallback_latency_s=time.monotonic() - started,
         )
         runs[method][budget] = run
-        if progress is not None:
+        if progress is not None and index not in completed_job_indexes:
             progress.update()
     return runs
+
+
+def update_completed_kvpress_jobs(
+    jobs: list[dict[str, Any]],
+    completed_job_indexes: set[int],
+    progress: tqdm | None,
+) -> None:
+    if progress is None:
+        return
+    for index, job in enumerate(jobs):
+        if index in completed_job_indexes:
+            continue
+        if not Path(str(job["output_json"])).exists():
+            continue
+        completed_job_indexes.add(index)
+        progress.set_postfix(
+            backend="kvpress",
+            method=str(job["method"]),
+            budget=job["budget_tokens"] or "full_cache",
+            completed=f"{len(completed_job_indexes)}/{len(jobs)}",
+            refresh=True,
+        )
+        progress.update()
 
 
 def progress_total(args: argparse.Namespace) -> int:
@@ -560,18 +606,21 @@ def collect_kvpress_run(
         validation_errors.append("KVPress command failed before writing result")
     if result.get("error"):
         validation_errors.append(f"KVPress evaluation failed: {result['error']}")
-    if bench.as_float(result.get("gsm8k_accuracy")) is None:
-        validation_errors.append("KVPress result has no GSM8K accuracy")
-    if bench.as_float(result.get("wikitext_word_perplexity")) is None:
-        validation_errors.append("KVPress result has no WikiText word_perplexity")
+    if not result.get("quality_skipped"):
+        if bench.as_float(result.get("gsm8k_accuracy")) is None:
+            validation_errors.append("KVPress result has no GSM8K accuracy")
+        if bench.as_float(result.get("wikitext_word_perplexity")) is None:
+            validation_errors.append("KVPress result has no WikiText word_perplexity")
+    latency_s = bench.as_float(result.get("latency_s"))
     return KvpressRun(
         method=method,
         budget_tokens=budget,
         completion_status="invalid" if validation_errors else "complete",
         artifacts=artifacts,
-        latency_s=bench.as_float(result.get("latency_s")) or fallback_latency_s,
+        latency_s=latency_s if latency_s is not None else fallback_latency_s,
         peak_memory_mib=bench.as_float(result.get("peak_memory_mib")),
         gsm8k_accuracy=bench.as_float(result.get("gsm8k_accuracy")),
+        wikitext_continuation_f1=bench.as_float(result.get("wikitext_continuation_f1")),
         wikitext_word_perplexity=bench.as_float(
             result.get("wikitext_word_perplexity")
         ),
@@ -631,6 +680,7 @@ def run_kvpress_one(
             latency_s=None,
             peak_memory_mib=None,
             gsm8k_accuracy=None,
+            wikitext_continuation_f1=None,
             wikitext_word_perplexity=None,
             validation_errors=[],
         )
@@ -732,8 +782,8 @@ def build_kvpress_eval_command(
         str(args.wikitext_limit),
         "--wikitext-max-words",
         str(args.wikitext_max_words),
-        "--min-prompt-budget-tokens",
-        str(min(args.budgets)),
+        "--wikitext-continuation-words",
+        str(args.wikitext_continuation_words),
         "--block-size",
         str(args.block_size),
         "--device",
@@ -749,6 +799,17 @@ def build_kvpress_eval_command(
     ]
     if budget is not None:
         command.extend(["--budget-tokens", str(budget)])
+    if getattr(args, "quality_min_prompt_budget_tokens", None) is not None:
+        command.extend(
+            [
+                "--min-prompt-budget-tokens",
+                str(args.quality_min_prompt_budget_tokens),
+            ]
+        )
+    if args.skip_wikitext_continuation:
+        command.append("--skip-wikitext-continuation")
+    if args.skip_quality:
+        command.append("--skip-quality")
     return command
 
 
@@ -756,7 +817,7 @@ def build_kvpress_batch_eval_command(
     args: argparse.Namespace,
     jobs_json: Path,
 ) -> list[str]:
-    return [
+    command = [
         sys.executable,
         str(Path(__file__).resolve()),
         "kvpress-eval-batch",
@@ -774,8 +835,8 @@ def build_kvpress_batch_eval_command(
         str(args.wikitext_limit),
         "--wikitext-max-words",
         str(args.wikitext_max_words),
-        "--min-prompt-budget-tokens",
-        str(min(args.budgets)),
+        "--wikitext-continuation-words",
+        str(args.wikitext_continuation_words),
         "--block-size",
         str(args.block_size),
         "--device",
@@ -789,6 +850,18 @@ def build_kvpress_batch_eval_command(
         "--hidden-states-buffer-size",
         str(args.kvpress_hidden_states_buffer_size),
     ]
+    if getattr(args, "quality_min_prompt_budget_tokens", None) is not None:
+        command.extend(
+            [
+                "--min-prompt-budget-tokens",
+                str(args.quality_min_prompt_budget_tokens),
+            ]
+        )
+    if args.skip_wikitext_continuation:
+        command.append("--skip-wikitext-continuation")
+    if args.skip_quality:
+        command.append("--skip-quality")
+    return command
 
 
 def normalize_rows(
@@ -810,6 +883,7 @@ def normalize_rows(
                     metrics={
                         "gsm8k": {"accuracy": run.gsm8k_accuracy},
                         "wikitext": {
+                            "continuation_f1": run.wikitext_continuation_f1,
                             "word_perplexity": run.wikitext_word_perplexity,
                         },
                     },
@@ -833,6 +907,7 @@ def normalize_rows(
                     metrics={
                         "gsm8k": {"accuracy": run.gsm8k_accuracy},
                         "wikitext": {
+                            "continuation_f1": run.wikitext_continuation_f1,
                             "word_perplexity": run.wikitext_word_perplexity,
                         },
                     },
@@ -940,6 +1015,8 @@ def plot_file_name(dataset: str, metric_name: str) -> str:
 
 
 def write_plots(root_dir: Path, rows: list[dict[str, Any]]) -> list[str]:
+    if not rows:
+        return []
     try:
         import matplotlib.pyplot as plt  # type: ignore[import-not-found]
     except ImportError:
@@ -1011,7 +1088,11 @@ def write_summary(
                 "runner": args.runner,
                 "vllm_quantization": args.quantization,
                 "transformers_quantization": args.transformers_quantization,
-                "quality_min_prompt_budget_tokens": min(args.budgets),
+                "quality_skipped": args.skip_quality,
+                "quality_min_prompt_budget_tokens": (
+                    getattr(args, "quality_min_prompt_budget_tokens", None)
+                ),
+                "skip_wikitext_continuation": args.skip_wikitext_continuation,
             },
             "paged_eviction_runs": {
                 runner: {
@@ -1144,18 +1225,26 @@ def append_sample_set_errors(
 
 
 def run_kvpress_eval(args: argparse.Namespace) -> int:
+    if args.skip_quality:
+        write_skipped_kvpress_result(args)
+        return 0
     torch, load_dataset, model, tokenizer, device = load_transformers_eval_model(args)
     run_kvpress_eval_loaded(args, torch, load_dataset, model, tokenizer, device)
     return 0
 
 
 def run_kvpress_eval_batch(args: argparse.Namespace) -> int:
-    torch, load_dataset, model, tokenizer, device = load_transformers_eval_model(args)
     jobs = bench.load_json(args.jobs_json).get("jobs", [])
     if not isinstance(jobs, list):
         raise ValueError(f"Expected jobs list in {args.jobs_json}")
+    if args.skip_quality:
+        write_skipped_kvpress_batch_results(args, jobs)
+        return 0
+
+    torch, load_dataset, model, tokenizer, device = load_transformers_eval_model(args)
     failed = False
-    for job in jobs:
+    total_jobs = len(jobs)
+    for index, job in enumerate(jobs, start=1):
         if not isinstance(job, dict):
             failed = True
             continue
@@ -1163,6 +1252,9 @@ def run_kvpress_eval_batch(args: argparse.Namespace) -> int:
         job_args.method = job.get("method")
         job_args.budget_tokens = job.get("budget_tokens")
         job_args.output_json = Path(str(job.get("output_json")))
+        label = kvpress_job_label(job_args.method, job_args.budget_tokens)
+        kvpress_log(f"[kvpress-batch] start {index}/{total_jobs} {label}")
+        job_started = time.monotonic()
         try:
             run_kvpress_eval_loaded(
                 job_args,
@@ -1174,6 +1266,10 @@ def run_kvpress_eval_batch(args: argparse.Namespace) -> int:
             )
         except Exception as exc:
             failed = True
+            kvpress_log(
+                f"[kvpress-batch] failed {index}/{total_jobs} {label}: "
+                f"{type(exc).__name__}: {exc}"
+            )
             bench.write_json(
                 job_args.output_json,
                 {
@@ -1184,7 +1280,62 @@ def run_kvpress_eval_batch(args: argparse.Namespace) -> int:
                     "error": f"{type(exc).__name__}: {exc}",
                 },
             )
+        else:
+            kvpress_log(
+                f"[kvpress-batch] complete {index}/{total_jobs} {label} "
+                f"in {time.monotonic() - job_started:.1f}s"
+            )
     return int(failed)
+
+
+def write_skipped_kvpress_batch_results(
+    args: argparse.Namespace,
+    jobs: list[Any],
+) -> None:
+    total_jobs = len(jobs)
+    for index, job in enumerate(jobs, start=1):
+        if not isinstance(job, dict):
+            continue
+        job_args = argparse.Namespace(**vars(args))
+        job_args.method = job.get("method")
+        job_args.budget_tokens = job.get("budget_tokens")
+        job_args.output_json = Path(str(job.get("output_json")))
+        kvpress_log(
+            "[kvpress-batch] skipped "
+            f"{index}/{total_jobs} "
+            f"{kvpress_job_label(job_args.method, job_args.budget_tokens)} "
+            "because --skip-quality was set"
+        )
+        write_skipped_kvpress_result(job_args)
+
+
+def write_skipped_kvpress_result(args: argparse.Namespace) -> None:
+    bench.write_json(
+        args.output_json,
+        {
+            "backend": "transformers",
+            "method": args.method,
+            "budget_tokens": args.budget_tokens,
+            "model": args.model,
+            "quality_skipped": True,
+            "latency_s": 0.0,
+            "peak_memory_mib": None,
+            "gsm8k_accuracy": None,
+            "wikitext_continuation_f1": None,
+            "wikitext_word_perplexity": None,
+            "gsm8k": {"skipped": True},
+            "wikitext": {"skipped": True},
+        },
+    )
+
+
+def kvpress_job_label(method: Any, budget: Any) -> str:
+    budget_label = "full_cache" if budget is None else f"budget_{budget}"
+    return f"{method}/{budget_label}"
+
+
+def kvpress_log(message: str) -> None:
+    print(message, flush=True)
 
 
 def load_transformers_eval_model(args: argparse.Namespace) -> tuple[Any, ...]:
@@ -1233,6 +1384,7 @@ def run_kvpress_eval_loaded(
         "latency_s": time.monotonic() - started,
         "peak_memory_mib": peak_memory_mib,
         "gsm8k_accuracy": gsm8k["accuracy"],
+        "wikitext_continuation_f1": wikitext.get("continuation_f1"),
         "wikitext_word_perplexity": wikitext["word_perplexity"],
         "gsm8k": gsm8k,
         "wikitext": wikitext,
@@ -1274,13 +1426,122 @@ def build_decoding_press(args: argparse.Namespace) -> Any:
     import kvpress  # type: ignore[import-not-found]
 
     method_cls = getattr(kvpress, args.method)
-    base_press = method_cls()
-    return kvpress.DecodingPress(
-        base_press=base_press,
+    prefill_press = build_target_size_prefill_press(
+        kvpress,
+        method_cls(),
+        args.budget_tokens,
+    )
+    decoding_press_cls = compatible_decoding_press_cls(kvpress.DecodingPress)
+    decoding_press = decoding_press_cls(
+        base_press=method_cls(),
         compression_interval=args.compression_interval,
         target_size=args.budget_tokens,
         hidden_states_buffer_size=args.hidden_states_buffer_size,
     )
+    prefill_decoding_press_cls = compatible_decoding_press_cls(
+        kvpress.PrefillDecodingPress
+    )
+    return prefill_decoding_press_cls(
+        prefilling_press=prefill_press,
+        decoding_press=decoding_press,
+    )
+
+
+def build_target_size_prefill_press(
+    kvpress: Any,
+    base_press: Any,
+    target_size: int,
+) -> Any:
+    class TargetSizePrefillPress(kvpress.BasePress):  # type: ignore[misc, valid-type]
+
+        def __init__(self, base_press: Any, target_size: int) -> None:
+            self.base_press = base_press
+            self.target_size = target_size
+
+        def post_init_from_model(self, model: Any) -> None:
+            self.base_press.post_init_from_model(model)
+
+        def compress(
+            self,
+            module: Any,
+            hidden_states: Any,
+            keys: Any,
+            values: Any,
+            attentions: Any,
+            kwargs: dict,
+        ) -> tuple[Any, Any]:
+            original_ratio = getattr(self.base_press, "compression_ratio", None)
+            if original_ratio is None:
+                raise TypeError(
+                    f"{type(self.base_press).__name__} does not expose "
+                    "compression_ratio"
+                )
+            self.base_press.compression_ratio = target_size_compression_ratio(
+                int(keys.shape[2]),
+                self.target_size,
+            )
+            try:
+                return self.base_press.compress(
+                    module,
+                    hidden_states,
+                    keys,
+                    values,
+                    attentions,
+                    kwargs,
+                )
+            finally:
+                self.base_press.compression_ratio = original_ratio
+
+    return TargetSizePrefillPress(base_press, target_size)
+
+
+def target_size_compression_ratio(seq_len: int, target_tokens: int) -> float:
+    if target_tokens <= 0:
+        raise ValueError("target_tokens must be positive")
+    if seq_len <= target_tokens:
+        return 0.0
+
+    ratio = 1.0 - (target_tokens / seq_len)
+    low = 0.0
+    high = 1.0
+    for _ in range(20):
+        n_kept = int(seq_len * (1.0 - ratio))
+        if n_kept == target_tokens:
+            return ratio
+        if n_kept > target_tokens:
+            low = ratio
+        else:
+            high = ratio
+        ratio = (low + high) / 2.0
+    return ratio
+
+
+def compatible_decoding_press_cls(decoding_press_cls: Any) -> Any:
+    class CompatibleDecodingPress(decoding_press_cls):  # type: ignore[misc, valid-type]
+
+        def forward_hook(
+            self,
+            module: Any,
+            input: list[Any],
+            kwargs: dict,
+            output: list,
+        ):
+            if "cache_position" not in kwargs:
+                cache_position = cache_position_from_kwargs(kwargs)
+                if cache_position is not None:
+                    kwargs = {**kwargs, "cache_position": cache_position}
+            return super().forward_hook(module, input, kwargs, output)
+
+    return CompatibleDecodingPress
+
+
+def cache_position_from_kwargs(kwargs: dict[str, Any]) -> Any | None:
+    position_ids = kwargs.get("position_ids")
+    if position_ids is None:
+        return None
+    if getattr(position_ids, "ndim", None) == 2:
+        return position_ids[0]
+    return position_ids
 
 
 def eval_gsm8k_hf(
@@ -1355,21 +1616,46 @@ def eval_wikitext_hf(
     ]
     total_nll = 0.0
     total_words = 0
+    total_f1 = 0.0
     evaluated = 0
     sample_indices = []
+    skip_continuation = getattr(args, "skip_wikitext_continuation", False)
     for sample_index, text in texts:
         words = text.split()
         prefix_words = words[: args.wikitext_max_words]
-        if not prefix_words:
+        continuation_words = words[
+            args.wikitext_max_words : args.wikitext_max_words
+            + args.wikitext_continuation_words
+        ]
+        if not prefix_words or not continuation_words:
             continue
         prompt = " ".join(prefix_words)
         if not hf_prompt_fits_budget(args, tokenizer, prompt):
             continue
-        inputs = tokenizer(prompt, return_tensors="pt").to(device)
-        outputs = model(**inputs, labels=inputs.input_ids)
-        token_count = max(int(inputs.input_ids.numel()) - 1, 1)
-        total_nll += float(outputs.loss) * token_count
-        total_words += len(prefix_words)
+        continuation = " ".join(continuation_words)
+        nll, _ = score_continuation_hf(
+            args,
+            model,
+            tokenizer,
+            device,
+            prompt,
+            continuation,
+        )
+        total_nll += nll
+        total_words += len(continuation_words)
+        if not skip_continuation:
+            generated_ids = model.generate(
+                **tokenizer(prompt, return_tensors="pt").to(device),
+                do_sample=False,
+                max_new_tokens=args.wikitext_continuation_words,
+                pad_token_id=tokenizer.eos_token_id,
+            )
+            prompt_tokens = tokenizer(prompt, return_tensors="pt").input_ids.shape[1]
+            prediction = tokenizer.decode(
+                generated_ids[0, prompt_tokens:],
+                skip_special_tokens=True,
+            )
+            total_f1 += bench.word_overlap_f1(prediction, continuation)
         sample_indices.append(sample_index)
         evaluated += 1
         if evaluated == args.wikitext_limit:
@@ -1378,12 +1664,78 @@ def eval_wikitext_hf(
         raise ValueError(
             f"evaluated {evaluated} WikiText samples; expected {args.wikitext_limit}"
         )
-    return {
+    result = {
         "word_perplexity": math.exp(total_nll / total_words),
         "num_samples": evaluated,
         "num_words": total_words,
+        "max_words_per_sample": args.wikitext_max_words,
+        "continuation_words_per_sample": args.wikitext_continuation_words,
         "sample_indices": sample_indices,
     }
+    if not skip_continuation:
+        result["continuation_f1"] = total_f1 / evaluated if evaluated else None
+    return result
+
+
+def score_continuation_hf(
+    args: argparse.Namespace,
+    model: Any,
+    tokenizer: Any,
+    device: Any,
+    prompt: str,
+    continuation: str,
+) -> tuple[float, int]:
+    import torch
+
+    prefix_inputs = tokenizer(prompt, return_tensors="pt").to(device)
+    continuation_inputs = tokenizer(
+        " " + continuation,
+        add_special_tokens=False,
+        return_tensors="pt",
+    ).to(device)
+    continuation_ids = continuation_inputs.input_ids
+    if int(continuation_ids.numel()) == 0:
+        raise ValueError("WikiText continuation tokenized to zero tokens")
+
+    prefix_outputs = model(**prefix_inputs, use_cache=True)
+    attention_mask = continuation_attention_mask(
+        prefix_inputs,
+        continuation_ids,
+    )
+    continuation_outputs = model(
+        input_ids=continuation_ids,
+        attention_mask=attention_mask,
+        past_key_values=prefix_outputs.past_key_values,
+        use_cache=True,
+    )
+
+    logits = prefix_outputs.logits[:, -1:, :]
+    if continuation_ids.shape[1] > 1:
+        logits = torch.cat(
+            (logits, continuation_outputs.logits[:, :-1, :]),
+            dim=1,
+        )
+    log_probs = logits.log_softmax(dim=-1)
+    token_log_probs = log_probs.gather(
+        -1,
+        continuation_ids.unsqueeze(-1),
+    ).squeeze(-1)
+    return -float(token_log_probs.sum()), int(continuation_ids.numel())
+
+
+def continuation_attention_mask(
+    prefix_inputs: Any,
+    continuation_ids: Any,
+) -> Any:
+    attention_mask = getattr(prefix_inputs, "attention_mask", None)
+    if attention_mask is None:
+        return None
+    return attention_mask.new_ones(
+        (
+            attention_mask.shape[0],
+            attention_mask.shape[1] + continuation_ids.shape[1],
+        )
+    )
 
 
 def hf_prompt_fits_budget(
@@ -1391,6 +1743,8 @@ def hf_prompt_fits_budget(
     tokenizer: Any,
     prompt: str,
 ) -> bool:
+    if args.min_prompt_budget_tokens is None:
+        return True
     token_count = len(tokenizer(prompt, add_special_tokens=False).input_ids)
     rounded_tokens = math.ceil(token_count / args.block_size) * args.block_size
     return rounded_tokens <= args.min_prompt_budget_tokens

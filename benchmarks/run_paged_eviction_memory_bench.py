@@ -20,6 +20,7 @@ import csv
 import json
 import math
 import os
+import random
 import re
 import shlex
 import shutil
@@ -91,6 +92,7 @@ class RunSummary:
     kv_cache_capacity_bytes: int | None
     peak_kv_cache_usage_fraction: float | None
     derived_peak_kv_cache_bytes: float | None
+    gpqa_accuracy: float | None
     gsm8k_accuracy: float | None
     wikitext_continuation_f1: float | None
     wikitext_word_perplexity: float | None
@@ -374,7 +376,23 @@ def build_arg_parser(
     quality.add_argument(
         "--skip-quality",
         action="store_true",
-        help="Skip GSM8K accuracy and WikiText perplexity evaluation.",
+        help="Skip the quality evaluation.",
+    )
+    quality.add_argument(
+        "--quality-dataset",
+        choices=("gpqa", "gsm8k-wikitext"),
+        default="gpqa",
+        help=(
+            "Quality workload. GPQA is the default experiment metric; "
+            "gsm8k-wikitext preserves the earlier benchmark behavior."
+        ),
+    )
+    quality.add_argument("--gpqa-limit", type=int, default=32)
+    quality.add_argument(
+        "--gpqa-max-tokens",
+        type=int,
+        default=1,
+        help=argparse.SUPPRESS,
     )
     quality.add_argument("--gsm8k-limit", type=int, default=8)
     quality.add_argument("--gsm8k-max-tokens", type=int, default=2048)
@@ -435,6 +453,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         args.random_input_len = 512
         args.random_output_len = 64
         args.max_concurrency = 2
+        args.gpqa_limit = min(args.gpqa_limit, 2)
         args.gsm8k_limit = min(args.gsm8k_limit, 2)
         args.wikitext_limit = min(args.wikitext_limit, 2)
     return args
@@ -473,7 +492,7 @@ def build_server_command(args: argparse.Namespace, enabled: bool) -> list[str]:
         "--enforce-eager",
         "--disable-cascade-attn",
         "--no-enable-chunked-prefill",
-        "--no-enable-prefix-caching",
+        "--enable-prefix-caching",
         "--no-async-scheduling",
         "--tensor-parallel-size",
         "1",
@@ -612,6 +631,7 @@ def run_one(
             "environment": {"VLLM_USE_V2_MODEL_RUNNER": RUNNER_ENV[runner]},
             "runner": runner,
             "paged_eviction_enabled": enabled,
+            "prefix_caching_enabled": True,
             "block_size": getattr(args, "block_size", None),
             "skip_serving_benchmark": getattr(args, "skip_serving_benchmark", False),
         },
@@ -713,7 +733,7 @@ def run_one(
                 with detail_progress(
                     phase_progress,
                     "quality samples",
-                    total=args.gsm8k_limit + args.wikitext_limit,
+                    total=quality_sample_count(args),
                     unit="sample",
                 ) as detail:
                     run_quality_evaluation(args, artifacts, progress=detail)
@@ -756,6 +776,12 @@ def run_phase_count(args: argparse.Namespace) -> int:
     if not args.skip_quality:
         total += 1
     return total
+
+
+def quality_sample_count(args: argparse.Namespace) -> int:
+    if getattr(args, "quality_dataset", "gsm8k-wikitext") == "gpqa":
+        return args.gpqa_limit
+    return args.gsm8k_limit + args.wikitext_limit
 
 
 def set_run_phase_progress(progress: tqdm | None, phase: str) -> None:
@@ -835,6 +861,7 @@ def empty_summary(
         kv_cache_capacity_bytes=None,
         peak_kv_cache_usage_fraction=None,
         derived_peak_kv_cache_bytes=None,
+        gpqa_accuracy=None,
         gsm8k_accuracy=None,
         wikitext_continuation_f1=None,
         wikitext_word_perplexity=None,
@@ -936,6 +963,137 @@ def post_completion(
 def extract_gsm8k_answer(text: str) -> str | None:
     matches = re.findall(r"-?\d+(?:,\d{3})*(?:\.\d+)?", text)
     return matches[-1].replace(",", "") if matches else None
+
+
+def extract_gpqa_answer(text: str) -> str | None:
+    patterns = (
+        r"(?i)\bfinal\s+answer\s*(?:is|:)\s*[\(\[]?([A-D])\b",
+        r"(?i)\banswer\s*(?:is|:)\s*[\(\[]?([A-D])\b",
+        r"(?i)\\boxed\{([A-D])\}",
+    )
+    for pattern in patterns:
+        matches = re.findall(pattern, text)
+        if matches:
+            return matches[-1].upper()
+    return None
+
+
+def gpqa_prompt_and_answer(
+    item: dict[str, Any],
+    seed: int,
+) -> tuple[str, str]:
+    choices = [
+        ("correct", str(item["Correct Answer"])),
+        ("incorrect", str(item["Incorrect Answer 1"])),
+        ("incorrect", str(item["Incorrect Answer 2"])),
+        ("incorrect", str(item["Incorrect Answer 3"])),
+    ]
+    record_id = str(item.get("Record ID", ""))
+    random.Random(f"{seed}:{record_id}").shuffle(choices)
+    labels = "ABCD"
+    correct_index = next(i for i, (kind, _) in enumerate(choices) if kind == "correct")
+    expected = labels[correct_index]
+    rendered_choices = "\n".join(
+        f"({label}) {answer}" for label, (_, answer) in zip(labels, choices)
+    )
+    prompt = (
+        "Select the best answer to the following multiple-choice question.\n\n"
+        f"Question: {item['Question']}\n\n"
+        f"Choices:\n{rendered_choices}\n\n"
+        "Answer:"
+    )
+    return prompt, expected
+
+
+def gpqa_choice_logprob(
+    args: argparse.Namespace,
+    tokenizer: Any,
+    prompt: str,
+    choice: str,
+) -> float:
+    combined_prompt = f"{prompt} {choice}"
+    response = post_completion(
+        args,
+        {
+            "prompt": combined_prompt,
+            "temperature": 0,
+            "max_tokens": 1,
+            "echo": True,
+            "logprobs": 1,
+            "seed": args.seed,
+        },
+    )
+    token_logprobs = response["choices"][0]["logprobs"]["token_logprobs"]
+    completion_tokens = as_int(response.get("usage", {}).get("completion_tokens"))
+    if completion_tokens:
+        token_logprobs = token_logprobs[:-completion_tokens]
+
+    prefix_ids = tokenizer(prompt).input_ids
+    combined_ids = tokenizer(combined_prompt).input_ids
+    common_prefix = 0
+    for prefix_id, combined_id in zip(prefix_ids, combined_ids):
+        if prefix_id != combined_id:
+            break
+        common_prefix += 1
+    choice_logprobs = token_logprobs[common_prefix : len(combined_ids)]
+    valid_logprobs = [
+        float(logprob) for logprob in choice_logprobs if logprob is not None
+    ]
+    if not valid_logprobs:
+        raise ValueError(f"GPQA choice {choice!r} has no prompt logprobs")
+    return sum(valid_logprobs) / len(valid_logprobs)
+
+
+def evaluate_gpqa(
+    args: argparse.Namespace,
+    progress: tqdm | None = None,
+) -> dict[str, Any]:
+    from datasets import load_dataset
+    from transformers import AutoTokenizer
+
+    dataset = load_dataset("Idavidrein/gpqa", "gpqa_main", split="train")
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    correct = 0
+    samples = []
+    for sample_index, item in enumerate(dataset):
+        prompt, expected = gpqa_prompt_and_answer(item, args.seed)
+        choice_logprobs = {
+            choice: gpqa_choice_logprob(args, tokenizer, prompt, choice)
+            for choice in "ABCD"
+        }
+        prediction = max(choice_logprobs, key=choice_logprobs.__getitem__)
+        is_correct = prediction == expected
+        correct += is_correct
+        samples.append(
+            {
+                "sample_index": sample_index,
+                "record_id": item.get("Record ID"),
+                "prediction": prediction,
+                "expected": expected,
+                "correct": is_correct,
+                "choice_mean_logprobs": choice_logprobs,
+            }
+        )
+        set_detail_postfix(progress, evaluator="gpqa", sample=sample_index + 1)
+        advance_progress(progress)
+        if len(samples) == args.gpqa_limit:
+            break
+    if len(samples) != args.gpqa_limit:
+        raise ValueError(
+            f"evaluated {len(samples)} GPQA samples; expected {args.gpqa_limit}"
+        )
+    return {
+        "dataset": "Idavidrein/gpqa",
+        "subset": "gpqa_main",
+        "split": "train",
+        "accuracy": correct / len(samples) if samples else None,
+        "correct": correct,
+        "invalid": 0,
+        "num_questions": len(samples),
+        "scoring_method": "mean_log_likelihood_of_answer_label",
+        "sample_indices": [sample["sample_index"] for sample in samples],
+        "samples": samples,
+    }
 
 
 def tokenize_quality_filter(args: argparse.Namespace) -> Any | None:
@@ -1144,6 +1302,15 @@ def run_quality_evaluation(
     artifacts: RunArtifacts,
     progress: tqdm | None = None,
 ) -> None:
+    if getattr(args, "quality_dataset", "gsm8k-wikitext") == "gpqa":
+        output_path = Path(artifacts.run_dir) / "gpqa.json"
+        try:
+            result = evaluate_gpqa(args, progress=progress)
+        except Exception as exc:
+            result = {"error": f"{type(exc).__name__}: {exc}"}
+        write_json(output_path, result)
+        return
+
     for evaluator, output_path in (
         (evaluate_gsm8k, Path(artifacts.gsm8k_json)),
         (evaluate_wikitext, Path(artifacts.wikitext_json)),
@@ -1178,6 +1345,7 @@ def summarize_run(
     artifacts: RunArtifacts,
 ) -> RunSummary:
     benchmark = load_json(Path(artifacts.benchmark_json))
+    gpqa = load_json(Path(artifacts.run_dir) / "gpqa.json")
     gsm8k = load_json(Path(artifacts.gsm8k_json))
     wikitext = load_json(Path(artifacts.wikitext_json))
     validation_errors = validate_artifacts(
@@ -1186,6 +1354,7 @@ def summarize_run(
         expected_completed=args.num_prompts,
         serving_required=not getattr(args, "skip_serving_benchmark", False),
         quality_required=not args.skip_quality,
+        quality_dataset=getattr(args, "quality_dataset", "gsm8k-wikitext"),
         wikitext_continuation_required=not getattr(
             args, "skip_wikitext_continuation", False
         ),
@@ -1210,11 +1379,7 @@ def summarize_run(
         runner=runner,
         label=label,
         paged_eviction_enabled=enabled,
-        completion_status=(
-            "complete"
-            if not validation_errors
-            else "invalid"
-        ),
+        completion_status=("complete" if not validation_errors else "invalid"),
         artifacts=artifacts,
         completed=as_int(benchmark.get("completed")),
         failed=as_int(benchmark.get("failed")),
@@ -1238,6 +1403,7 @@ def summarize_run(
         kv_cache_capacity_bytes=capacity_bytes,
         peak_kv_cache_usage_fraction=peak_usage,
         derived_peak_kv_cache_bytes=derived_peak_kv,
+        gpqa_accuracy=as_float(gpqa.get("accuracy")),
         gsm8k_accuracy=as_float(gsm8k.get("accuracy")),
         wikitext_continuation_f1=as_float(wikitext.get("continuation_f1")),
         wikitext_word_perplexity=as_float(wikitext.get("word_perplexity")),
@@ -1253,6 +1419,7 @@ def validate_artifacts(
     quality_required: bool,
     serving_required: bool = True,
     wikitext_continuation_required: bool = True,
+    quality_dataset: str = "gsm8k-wikitext",
 ) -> list[str]:
     errors: list[str] = []
     required_artifacts = {
@@ -1269,12 +1436,15 @@ def validate_artifacts(
             }
         )
     if quality_required:
-        required_artifacts.update(
-            {
-                "GSM8K json": artifacts.gsm8k_json,
-                "WikiText json": artifacts.wikitext_json,
-            }
-        )
+        if quality_dataset == "gpqa":
+            required_artifacts["GPQA json"] = str(Path(artifacts.run_dir) / "gpqa.json")
+        else:
+            required_artifacts.update(
+                {
+                    "GSM8K json": artifacts.gsm8k_json,
+                    "WikiText json": artifacts.wikitext_json,
+                }
+            )
     for label, path_str in required_artifacts.items():
         path = Path(path_str)
         if not path.exists():
@@ -1301,9 +1471,7 @@ def validate_artifacts(
             errors.append("nvidia-smi CSV has no successful memory samples")
 
         if load_peak_kv_usage(Path(artifacts.metrics_jsonl)) is None:
-            errors.append(
-                f"metrics samples contain no {KV_CACHE_USAGE_METRIC} values"
-            )
+            errors.append(f"metrics samples contain no {KV_CACHE_USAGE_METRIC} values")
 
     server_log_path = Path(artifacts.server_log)
     if server_log_path.exists():
@@ -1313,6 +1481,12 @@ def validate_artifacts(
             errors.append(f"server log contains error marker: {match.group(0)!r}")
 
     if quality_required:
+        if quality_dataset == "gpqa":
+            gpqa = load_json(Path(artifacts.run_dir) / "gpqa.json")
+            if as_float(gpqa.get("accuracy")) is None:
+                errors.append("GPQA result has no accuracy metric")
+            return errors
+
         gsm8k = load_json(Path(artifacts.gsm8k_json))
         wikitext = load_json(Path(artifacts.wikitext_json))
         if as_float(gsm8k.get("accuracy")) is None:
@@ -1436,6 +1610,7 @@ def write_summary(
                 "cache_budget_tokens": args.cache_budget_tokens,
                 "block_size": getattr(args, "block_size", None),
                 "assumed_default_block_size": DEFAULT_KV_CACHE_BLOCK_SIZE,
+                "enable_prefix_caching": True,
             },
             "workload": {
                 "serving_benchmark_enabled": not getattr(
@@ -1454,6 +1629,9 @@ def write_summary(
             "runners": selected_runners(args.runner),
             "quality": {
                 "enabled": not args.skip_quality,
+                "dataset": getattr(args, "quality_dataset", "gsm8k-wikitext"),
+                "gpqa_limit": getattr(args, "gpqa_limit", None),
+                "gpqa_max_tokens": getattr(args, "gpqa_max_tokens", None),
                 "gsm8k_limit": args.gsm8k_limit,
                 "gsm8k_max_tokens": args.gsm8k_max_tokens,
                 "wikitext_limit": args.wikitext_limit,
@@ -1515,6 +1693,181 @@ def write_summary_csv(
                 )
 
 
+def write_comparison_plots(
+    root_dir: Path,
+    runs: dict[str, dict[str, RunSummary]],
+) -> list[str]:
+    import matplotlib.pyplot as plt
+
+    plots_dir = root_dir / "plots"
+    plots_dir.mkdir(parents=True, exist_ok=True)
+    labels = []
+    for runner in runs:
+        runner_label = "" if len(runs) == 1 else f"{runner}\n"
+        labels.extend(
+            (
+                f"{runner_label}Without\nPagedEviction",
+                f"{runner_label}With\nPagedEviction",
+            )
+        )
+    flat_runs = [
+        runs[runner][mode] for runner in runs for mode in ("disabled", "enabled")
+    ]
+    colors = ["#6c757d" if run.label == "disabled" else "#0072b2" for run in flat_runs]
+    written = []
+
+    def bar_plot(
+        filename: str,
+        title: str,
+        ylabel: str,
+        values: list[float | None],
+    ) -> None:
+        if not any(value is not None for value in values):
+            return
+        numeric = [float("nan") if value is None else value for value in values]
+        fig, ax = plt.subplots(figsize=(7.2, 4.5))
+        bars = ax.bar(labels, numeric, color=colors)
+        ax.set_title(title)
+        ax.set_ylabel(ylabel)
+        ax.grid(axis="y", alpha=0.25)
+        for bar, value in zip(bars, values):
+            if value is not None:
+                annotation = f"{value:,.0f}" if abs(value) >= 100 else f"{value:.3g}"
+                ax.text(
+                    bar.get_x() + bar.get_width() / 2,
+                    bar.get_height(),
+                    annotation,
+                    ha="center",
+                    va="bottom",
+                )
+        fig.tight_layout()
+        path = plots_dir / filename
+        fig.savefig(path, dpi=180)
+        plt.close(fig)
+        written.append(str(path))
+
+    def grouped_bar_plot(
+        filename: str,
+        title: str,
+        ylabel: str,
+        series: list[tuple[str, list[float | None]]],
+    ) -> None:
+        if not any(value is not None for _, values in series for value in values):
+            return
+        positions = list(range(len(labels)))
+        width = 0.8 / len(series)
+        fig, ax = plt.subplots(figsize=(7.2, 4.5))
+        for series_index, (series_label, values) in enumerate(series):
+            offset = (series_index - (len(series) - 1) / 2) * width
+            bars = ax.bar(
+                [position + offset for position in positions],
+                [float("nan") if value is None else value for value in values],
+                width,
+                label=series_label,
+            )
+            for bar, value in zip(bars, values):
+                if value is not None:
+                    ax.text(
+                        bar.get_x() + bar.get_width() / 2,
+                        bar.get_height(),
+                        f"{value:,.0f}",
+                        ha="center",
+                        va="bottom",
+                    )
+        ax.set_xticks(positions, labels)
+        ax.set_title(title)
+        ax.set_ylabel(ylabel)
+        ax.grid(axis="y", alpha=0.25)
+        ax.legend()
+        fig.tight_layout()
+        path = plots_dir / filename
+        fig.savefig(path, dpi=180)
+        plt.close(fig)
+        written.append(str(path))
+
+    bar_plot(
+        "memory_peak_kv_gib.png",
+        "Peak occupied KV-cache memory",
+        "GiB",
+        [bytes_to_gib(run.derived_peak_kv_cache_bytes) for run in flat_runs],
+    )
+    grouped_bar_plot(
+        "ttft_p50_p99_ms.png",
+        "Time to first token",
+        "milliseconds",
+        [
+            ("p50", [run.p50_ttft_ms for run in flat_runs]),
+            ("p99", [run.p99_ttft_ms for run in flat_runs]),
+        ],
+    )
+    bar_plot(
+        "throughput_output_tokens_per_s.png",
+        "Output-token throughput",
+        "tokens / second",
+        [run.output_throughput for run in flat_runs],
+    )
+    bar_plot(
+        "gpqa_accuracy.png",
+        "GPQA accuracy",
+        "accuracy",
+        [run.gpqa_accuracy for run in flat_runs],
+    )
+
+    fig, ax = plt.subplots(figsize=(7.2, 4.5))
+    time_series_written = False
+    for run, color, label in zip(flat_runs, colors, labels):
+        artifacts = run.artifacts
+        metrics_path = (
+            artifacts.metrics_jsonl
+            if isinstance(artifacts, RunArtifacts)
+            else artifacts["metrics_jsonl"]
+        )
+        samples = []
+        with Path(metrics_path).open(encoding="utf-8") as file:
+            for line in file:
+                with contextlib.suppress(json.JSONDecodeError):
+                    sample = json.loads(line)
+                    if sample.get("phase") != "benchmark":
+                        continue
+                    timestamp = as_float(sample.get("monotonic_s"))
+                    usage = as_float(sample.get("kv_cache_usage_perc_max"))
+                    if timestamp is not None and usage is not None:
+                        samples.append((timestamp, usage))
+        if not samples or run.kv_cache_capacity_bytes is None:
+            continue
+        start = samples[0][0]
+        occupied_gib = [
+            run.kv_cache_capacity_bytes * usage / (1024**3) for _, usage in samples
+        ]
+        ax.plot(
+            [timestamp - start for timestamp, _ in samples],
+            occupied_gib,
+            color=color,
+            label=label.replace("\n", " "),
+            linewidth=1.8,
+        )
+        time_series_written = True
+    if time_series_written:
+        ax.set_title("Occupied KV-cache memory over benchmark time")
+        ax.set_xlabel("elapsed seconds")
+        ax.set_ylabel("GiB")
+        ax.grid(alpha=0.25)
+        ax.legend()
+        fig.tight_layout()
+        path = plots_dir / "memory_kv_over_time.png"
+        fig.savefig(path, dpi=180)
+        written.append(str(path))
+    plt.close(fig)
+    return written
+
+
+def record_plot_paths(root_dir: Path, plot_paths: list[str]) -> None:
+    summary_path = root_dir / "summary.json"
+    summary = load_json(summary_path)
+    summary["plots"] = plot_paths
+    write_json(summary_path, summary)
+
+
 def summary_metric_names() -> list[str]:
     return [
         "peak_benchmark_gpu_memory_mib",
@@ -1530,6 +1883,7 @@ def summary_metric_names() -> list[str]:
         "request_throughput",
         "completed",
         "failed",
+        "gpqa_accuracy",
         "gsm8k_accuracy",
         "wikitext_continuation_f1",
         "wikitext_word_perplexity",
@@ -1563,6 +1917,7 @@ def print_terminal_table(runner: str, runs: dict[str, RunSummary]) -> None:
             disabled.total_token_throughput,
             enabled.total_token_throughput,
         ),
+        ("gpqa_accuracy", disabled.gpqa_accuracy, enabled.gpqa_accuracy),
         ("failed", disabled.failed, enabled.failed),
     ]
     table = [["metric", "disabled", "enabled", "delta_pct"]]
@@ -1715,6 +2070,8 @@ def main() -> int:
             "enabled": run_one(args, root_dir, runner, "enabled", enabled=True),
         }
     write_summary(root_dir, args, runs)
+    plot_paths = write_comparison_plots(root_dir, runs)
+    record_plot_paths(root_dir, plot_paths)
     for runner, runner_runs in runs.items():
         print_terminal_table(runner, runner_runs)
     print(f"\nsummary: {root_dir / 'summary.json'}")

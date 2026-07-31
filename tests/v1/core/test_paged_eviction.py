@@ -11,6 +11,7 @@ from vllm.config import PagedEvictionConfig, VllmConfig
 from vllm.sampling_params import SamplingParams
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.core.kv_cache_manager import KVCacheManager
+from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import (
     PagedEvictionRequestState,
@@ -27,7 +28,11 @@ from vllm.v1.request import Request, RequestStatus
 pytestmark = pytest.mark.cpu_test
 
 
-def make_manager(block_size: int = 4, num_blocks: int = 8) -> KVCacheManager:
+def make_manager(
+    block_size: int = 4,
+    num_blocks: int = 8,
+    enable_caching: bool = False,
+) -> KVCacheManager:
     kv_cache_config = KVCacheConfig(
         num_blocks=num_blocks,
         kv_cache_tensors=[],
@@ -48,7 +53,7 @@ def make_manager(block_size: int = 4, num_blocks: int = 8) -> KVCacheManager:
         max_model_len=64,
         scheduler_block_size=block_size,
         hash_block_size=block_size,
-        enable_caching=False,
+        enable_caching=enable_caching,
     )
 
 
@@ -118,7 +123,6 @@ def make_validation_config() -> VllmConfig:
         ("scheduler_config.scheduler_cls", "custom", "default scheduler"),
         ("speculative_config", object(), "speculative decoding"),
         ("diffusion_config", object(), "diffusion models"),
-        ("cache_config.enable_prefix_caching", True, "prefix caching"),
         ("cache_config.cache_dtype", "fp8", "float16 or bfloat16"),
         ("model_config.dtype", torch.float32, "float16 or bfloat16"),
         ("cache_config.sliding_window", 128, "full attention"),
@@ -146,6 +150,13 @@ def test_unsupported_configurations_fail_validation(path, value, message):
 
 def test_supported_configuration_passes_validation():
     make_validation_config()._validate_paged_eviction_config()
+
+
+def test_prefix_caching_configuration_passes_validation():
+    config = make_validation_config()
+    config.cache_config.enable_prefix_caching = True
+
+    config._validate_paged_eviction_config()
 
 
 def test_scheduler_rejects_multiple_kv_cache_groups():
@@ -279,15 +290,70 @@ def test_remove_active_block_frees_exactly_one_block():
     assert manager.get_block_ids(request.request_id)[0] == block_ids[1:]
 
 
-def test_remove_active_block_rejects_shared_block():
-    manager = make_manager()
+def test_remove_active_prefix_cached_block_preserves_shared_cache():
+    manager = make_manager(enable_caching=True)
+    first_request = make_request("first")
+    first_request.block_hashes = [BlockHash(b"0"), BlockHash(b"1")]
+    assert manager.allocate_slots(first_request, 8, num_required_tokens=8) is not None
+
+    second_request = make_request("second")
+    second_request.block_hashes = first_request.block_hashes.copy()
+    computed_blocks, num_computed_tokens = manager.get_computed_blocks(second_request)
+    assert num_computed_tokens == 4
+    assert (
+        manager.allocate_slots(
+            second_request,
+            num_new_tokens=4,
+            num_new_computed_tokens=num_computed_tokens,
+            new_computed_blocks=computed_blocks,
+            num_required_tokens=8,
+        )
+        is not None
+    )
+
+    shared_block = manager.get_blocks(first_request.request_id).blocks[0][0]
+    assert shared_block.ref_cnt == 2
+    manager.remove_active_block(first_request.request_id, shared_block.block_id)
+
+    assert shared_block.ref_cnt == 1
+    assert shared_block.block_hash is not None
+    assert manager.get_block_ids(second_request.request_id)[0][0] == (
+        shared_block.block_id
+    )
+
+
+def test_evicted_request_does_not_cache_compressed_decode_blocks():
+    manager = make_manager(enable_caching=True)
     request = make_request()
+    request.block_hashes = [BlockHash(b"0"), BlockHash(b"1")]
     assert manager.allocate_slots(request, 8, num_required_tokens=8) is not None
 
-    block = manager.get_blocks(request.request_id).blocks[0][0]
-    block.ref_cnt += 1
-    with pytest.raises(ValueError, match="shared KV cache block"):
-        manager.remove_active_block(request.request_id, block.block_id)
+    first_block_id = manager.get_block_ids(request.request_id)[0][0]
+    manager.remove_active_block(request.request_id, first_block_id)
+
+    for token_id in range(8, 12):
+        request.append_output_token_ids(token_id)
+    request.num_computed_tokens = 8
+    new_blocks = manager.allocate_slots(request, 4, num_required_tokens=8)
+    assert new_blocks is not None
+
+    new_block = new_blocks.blocks[0][0]
+    assert new_block.block_hash is None
+
+
+def test_prefix_cache_hit_counts_as_resident_tokens():
+    scheduler = object.__new__(Scheduler)
+    scheduler.paged_eviction_config = PagedEvictionConfig(cache_budget_tokens=8)
+    scheduler.paged_eviction_states = {"request": PagedEvictionRequestState()}
+
+    required_tokens = scheduler._paged_eviction_required_tokens(
+        "request",
+        num_new_tokens=4,
+        num_computed_tokens=4,
+    )
+
+    assert required_tokens == 8
+    assert scheduler.paged_eviction_states["request"].resident_tokens == 4
 
 
 def test_scheduler_repeated_eviction_preserves_logical_progress_and_order():

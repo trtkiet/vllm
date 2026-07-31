@@ -46,7 +46,8 @@ def write_valid_artifacts(artifacts: bench.RunArtifacts) -> dict[str, object]:
         json.dumps({"accuracy": 0.25}) + "\n", encoding="utf-8"
     )
     Path(artifacts.wikitext_json).write_text(
-        json.dumps({"word_perplexity": 12.5}) + "\n", encoding="utf-8"
+        json.dumps({"continuation_f1": 0.5, "word_perplexity": 12.5}) + "\n",
+        encoding="utf-8",
     )
     return benchmark
 
@@ -128,6 +129,52 @@ def test_validation_requires_quality_metrics(tmp_path: Path):
     assert any("GSM8K" in error and "accuracy" in error for error in errors)
 
 
+def test_validation_allows_skipped_wikitext_continuation(tmp_path: Path):
+    artifacts = make_artifacts(tmp_path)
+    benchmark = write_valid_artifacts(artifacts)
+    Path(artifacts.wikitext_json).write_text(
+        json.dumps({"word_perplexity": 12.5}) + "\n",
+        encoding="utf-8",
+    )
+
+    errors = bench.validate_artifacts(
+        artifacts,
+        benchmark,
+        expected_completed=4,
+        quality_required=True,
+        wikitext_continuation_required=False,
+    )
+
+    assert errors == []
+
+
+def test_validation_allows_skipped_serving_benchmark(tmp_path: Path):
+    artifacts = make_artifacts(tmp_path)
+    run_dir = Path(artifacts.run_dir)
+    run_dir.mkdir(parents=True)
+    Path(artifacts.server_log).write_text("INFO server ready\n", encoding="utf-8")
+    Path(artifacts.command_json).write_text("{}\n", encoding="utf-8")
+    Path(artifacts.gsm8k_json).write_text(
+        json.dumps({"accuracy": 0.25}) + "\n",
+        encoding="utf-8",
+    )
+    Path(artifacts.wikitext_json).write_text(
+        json.dumps({"word_perplexity": 12.5}) + "\n",
+        encoding="utf-8",
+    )
+
+    errors = bench.validate_artifacts(
+        artifacts,
+        {},
+        expected_completed=4,
+        quality_required=True,
+        serving_required=False,
+        wikitext_continuation_required=False,
+    )
+
+    assert errors == []
+
+
 @pytest.mark.parametrize(("runner", "expected"), [("legacy", "0"), ("v2", "1")])
 def test_runner_environment_sets_model_runner(monkeypatch, runner: str, expected: str):
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "unexpected")
@@ -135,6 +182,57 @@ def test_runner_environment_sets_model_runner(monkeypatch, runner: str, expected
     env = bench.server_environment(runner)
 
     assert env["VLLM_USE_V2_MODEL_RUNNER"] == expected
+
+
+def test_build_server_command_passes_block_size():
+    args = argparse.Namespace(
+        model="model",
+        host="127.0.0.1",
+        port=8000,
+        max_model_len=128,
+        max_num_seqs=1,
+        max_num_batched_tokens=128,
+        gpu_memory_utilization=0.9,
+        quantization=None,
+        block_size=32,
+        cache_budget_tokens=16,
+    )
+
+    command = bench.build_server_command(args, enabled=False)
+
+    assert "--block-size" in command
+    assert command[command.index("--block-size") + 1] == "32"
+    assert "--enable-prefix-caching" in command
+    assert "--no-enable-prefix-caching" not in command
+
+
+def test_gpqa_answer_order_is_deterministic():
+    item = {
+        "Question": "question",
+        "Correct Answer": "correct",
+        "Incorrect Answer 1": "wrong 1",
+        "Incorrect Answer 2": "wrong 2",
+        "Incorrect Answer 3": "wrong 3",
+        "Record ID": "record",
+    }
+
+    first = bench.gpqa_prompt_and_answer(item, seed=7)
+    second = bench.gpqa_prompt_and_answer(item, seed=7)
+
+    assert first == second
+    assert f"({first[1]}) correct" in first[0]
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("reasoning\\nFinal answer: C", "C"),
+        ("Answer is (B).", "B"),
+        ("there is no parseable conclusion", None),
+    ],
+)
+def test_extract_gpqa_answer(text: str, expected: str | None):
+    assert bench.extract_gpqa_answer(text) == expected
 
 
 def test_write_summary_uses_nested_runner_layout(tmp_path: Path):
@@ -148,6 +246,7 @@ def test_write_summary_uses_nested_runner_layout(tmp_path: Path):
         max_num_seqs=1,
         max_num_batched_tokens=128,
         gpu_memory_utilization=0.9,
+        block_size=32,
         cache_budget_tokens=16,
         num_prompts=1,
         random_input_len=8,
@@ -164,6 +263,7 @@ def test_write_summary_uses_nested_runner_layout(tmp_path: Path):
         gsm8k_max_tokens=8,
         wikitext_limit=1,
         wikitext_max_words=8,
+        wikitext_continuation_words=4,
     )
 
     bench.write_summary(
@@ -174,3 +274,4 @@ def test_write_summary_uses_nested_runner_layout(tmp_path: Path):
 
     data = json.loads((tmp_path / "summary.json").read_text(encoding="utf-8"))
     assert data["runs"]["legacy"]["disabled"]["runner"] == "legacy"
+    assert data["config"]["server"]["block_size"] == 32

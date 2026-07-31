@@ -84,6 +84,9 @@ class SingleTypeKVCacheManager(ABC):
         # This is only used to track the RUNNING requests, we do not track the
         # data for preempted ones.
         self.num_cached_block: dict[str, int] = {}
+        # Requests whose block tables no longer represent their full token
+        # histories must not contribute additional prefix-cache entries.
+        self.cache_blocks_disabled: set[str] = set()
 
         self.kv_cache_group_id = kv_cache_group_id
         self._null_block = block_pool.null_block
@@ -313,6 +316,9 @@ class SingleTypeKVCacheManager(ABC):
                 boundary; a positive multiple of ``scheduler_block_size`` keeps
                 a tail once per that-sized segment. Only SWA acts on it.
         """
+        if request.request_id in self.cache_blocks_disabled:
+            return
+
         num_cached_blocks = self.num_cached_block.get(request.request_id, 0)
         num_full_blocks = num_tokens // self.block_size
 
@@ -376,9 +382,10 @@ class SingleTypeKVCacheManager(ABC):
 
         self.block_pool.free_blocks(ordered_blocks)
         self.num_cached_block.pop(request_id, None)
+        self.cache_blocks_disabled.discard(request_id)
 
     def remove_active_block(self, request_id: str, block_id: int) -> None:
-        """Remove one exclusively owned block from an active request."""
+        """Remove one block reference from an active request."""
         blocks = self.req_to_blocks.get(request_id)
         if not blocks:
             raise ValueError(f"Request {request_id!r} has no allocated KV blocks.")
@@ -388,22 +395,20 @@ class SingleTypeKVCacheManager(ABC):
         ]
         if len(matching_indices) != 1:
             raise ValueError(
-                f"Block {block_id} is not uniquely owned by request {request_id!r}."
+                f"Block {block_id} is not present exactly once in request "
+                f"{request_id!r}."
             )
 
         block_index = matching_indices[0]
         block = blocks[block_index]
         if block.is_null:
             raise ValueError("Cannot remove the null KV cache block.")
-        if block.ref_cnt != 1:
-            raise ValueError(
-                f"Cannot remove shared KV cache block {block_id} "
-                f"with ref_cnt={block.ref_cnt}."
-            )
-        if block.block_hash is not None or request_id in self.num_cached_block:
-            raise ValueError("Cannot actively remove a prefix-cached KV cache block.")
+        if block.ref_cnt < 1:
+            raise ValueError(f"Block {block_id} is not owned by an active request.")
 
         blocks.pop(block_index)
+        if self.enable_caching:
+            self.cache_blocks_disabled.add(request_id)
         self.block_pool.free_blocks([block], prepend=True)
 
     @abstractmethod

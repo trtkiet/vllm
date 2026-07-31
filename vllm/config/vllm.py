@@ -913,8 +913,6 @@ class VllmConfig:
             raise ValueError("PagedEviction does not support speculative decoding.")
         if self.diffusion_config is not None:
             raise ValueError("PagedEviction does not support diffusion models.")
-        if self.cache_config.enable_prefix_caching:
-            raise ValueError("PagedEviction does not support prefix caching.")
         cache_dtype = self.cache_config.cache_dtype
         if cache_dtype == "auto":
             cache_dtype = str(self.model_config.dtype).removeprefix("torch.")
