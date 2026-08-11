@@ -9,7 +9,7 @@ from vllm.utils.hashing import safe_hash
 
 @config
 class PagedEvictionConfig:
-    """Configuration for decode-only block-wise KV cache eviction."""
+    """Configuration for block-wise KV cache eviction during generation."""
 
     cache_budget_tokens: int = Field(gt=0)
     """Maximum number of full resident KV tokens per request."""

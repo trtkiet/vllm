@@ -65,6 +65,24 @@ def test_worker_scores_only_when_new_block_becomes_full():
     assert list(scores["request"]) == [0, 1, 2]
 
 
+def test_worker_excludes_partial_tail_from_prefill_scores():
+    state = PagedEvictionWorkerState(
+        PagedEvictionConfig(cache_budget_tokens=4),
+        block_size=2,
+    )
+    state.update_from_scheduler({"request": 4}, [])
+
+    kv_cache = torch.ones(4, 2, 2, 1, 2)
+    scores = state.score_requests(
+        [kv_cache],
+        {"request": [0, 1, 2, 3]},
+        {"request": 3},
+    )
+
+    assert scores is not None
+    assert list(scores["request"]) == [0, 1, 2]
+
+
 def test_worker_uses_finalized_block_size():
     state = PagedEvictionWorkerState(
         PagedEvictionConfig(cache_budget_tokens=16),

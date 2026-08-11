@@ -100,6 +100,27 @@ def test_validation_fails_server_log_error(tmp_path: Path):
     assert any("server log contains error marker" in error for error in errors)
 
 
+def test_validation_ignores_error_after_requested_shutdown(tmp_path: Path):
+    artifacts = make_artifacts(tmp_path)
+    benchmark = write_valid_artifacts(artifacts)
+    Path(artifacts.server_log).write_text(
+        "[shutdown] EngineCore: trigger received signal=SIGTERM\n"
+        "ERROR AsyncLLM output_handler failed\n"
+        "Traceback (most recent call last):\n"
+        "EngineDeadError: EngineCore encountered an issue\n",
+        encoding="utf-8",
+    )
+
+    errors = bench.validate_artifacts(
+        artifacts,
+        benchmark,
+        expected_completed=4,
+        quality_required=True,
+    )
+
+    assert errors == []
+
+
 def test_validation_parses_quality_results(tmp_path: Path):
     artifacts = make_artifacts(tmp_path)
     benchmark = write_valid_artifacts(artifacts)
@@ -173,6 +194,102 @@ def test_validation_allows_skipped_serving_benchmark(tmp_path: Path):
     )
 
     assert errors == []
+
+
+def test_validation_parses_ruler_result(tmp_path: Path):
+    artifacts = make_artifacts(tmp_path)
+    benchmark = write_valid_artifacts(artifacts)
+    (Path(artifacts.run_dir) / "ruler.json").write_text(
+        json.dumps({"score_percent": 75.0}) + "\n",
+        encoding="utf-8",
+    )
+
+    errors = bench.validate_artifacts(
+        artifacts,
+        benchmark,
+        expected_completed=4,
+        quality_required=True,
+        quality_dataset="ruler",
+    )
+
+    assert errors == []
+
+
+@pytest.mark.parametrize(
+    ("prediction", "references", "match_all", "expected"),
+    [
+        ("alpha and beta", ["alpha", "beta"], True, 1.0),
+        ("alpha", ["alpha", "beta"], True, 0.5),
+        ("alias", ["answer", "alias"], False, 1.0),
+    ],
+)
+def test_ruler_sample_score_matches_official_substring_metric(
+    prediction: str,
+    references: list[str],
+    match_all: bool,
+    expected: float,
+):
+    assert (
+        bench.ruler_sample_score(
+            prediction,
+            references,
+            match_all=match_all,
+        )
+        == expected
+    )
+
+
+def test_evaluate_ruler_aggregates_task_scores(monkeypatch):
+    import datasets
+
+    rows = {
+        "niah_single_1": [
+            {
+                "index": 1,
+                "input": "needle prompt ",
+                "answer_prefix": "answer:",
+                "outputs": ["alpha", "beta"],
+                "length": 8192,
+            }
+        ],
+        "qa_1": [
+            {
+                "index": 2,
+                "input": "qa prompt ",
+                "answer_prefix": "answer:",
+                "outputs": ["answer", "alias"],
+                "length": 8192,
+            }
+        ],
+    }
+
+    def fake_load_dataset(name: str, *, split: str, streaming: bool):
+        assert name == "example/RULER-8192"
+        assert streaming
+        return rows[split]
+
+    def fake_post_completion(args, payload):
+        del args
+        text = "alpha" if payload["prompt"].startswith("needle") else "alias"
+        return {"choices": [{"text": text}], "usage": {"completion_tokens": 1}}
+
+    monkeypatch.setattr(datasets, "load_dataset", fake_load_dataset)
+    monkeypatch.setattr(bench, "post_completion", fake_post_completion)
+    args = argparse.Namespace(
+        model="model",
+        ruler_context_length=8192,
+        ruler_dataset_pattern="example/RULER-{context_length}",
+        ruler_tasks=["niah_single_1", "qa_1"],
+        ruler_samples_per_task=1,
+        seed=0,
+    )
+
+    result = bench.evaluate_ruler(args)
+
+    assert result["score_percent"] == 75.0
+    assert result["accuracy"] == 0.75
+    assert result["tasks"]["niah_single_1"]["score_percent"] == 50.0
+    assert result["tasks"]["qa_1"]["score_percent"] == 100.0
 
 
 @pytest.mark.parametrize(("runner", "expected"), [("legacy", "0"), ("v2", "1")])

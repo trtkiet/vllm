@@ -119,7 +119,6 @@ def make_validation_config() -> VllmConfig:
         ("model_config.disable_cascade_attn", False, "cascade attention"),
         ("parallel_config.tensor_parallel_size", 2, "TP=PP=DP=PCP=DCP=1"),
         ("scheduler_config.async_scheduling", True, "synchronous scheduling"),
-        ("scheduler_config.enable_chunked_prefill", True, "chunked prefill"),
         ("scheduler_config.scheduler_cls", "custom", "default scheduler"),
         ("speculative_config", object(), "speculative decoding"),
         ("diffusion_config", object(), "diffusion models"),
@@ -149,7 +148,10 @@ def test_unsupported_configurations_fail_validation(path, value, message):
 
 
 def test_supported_configuration_passes_validation():
-    make_validation_config()._validate_paged_eviction_config()
+    config = make_validation_config()
+    config.scheduler_config.enable_chunked_prefill = True
+
+    config._validate_paged_eviction_config()
 
 
 def test_prefix_caching_configuration_passes_validation():
@@ -184,29 +186,35 @@ def test_scheduler_rejects_multiple_kv_cache_groups():
 def test_scheduler_computes_safe_concurrency_cap():
     scheduler = object.__new__(Scheduler)
     scheduler.block_size = 4
+    scheduler.max_num_running_reqs = 8
+    scheduler.max_num_scheduled_tokens = 4
     scheduler.kv_cache_manager = make_manager(block_size=4, num_blocks=10)
     scheduler.paged_eviction_config = PagedEvictionConfig(cache_budget_tokens=8)
 
     scheduler._initialize_paged_eviction_capacity()
 
-    # One block is reserved as the null block. Each active request reserves
-    # two budget blocks and one temporary decode block.
+    # One block is reserved as the null block. Three active requests can each
+    # open a transient block within the four-token shared scheduling budget.
     assert scheduler.paged_eviction_max_running_reqs == 3
 
 
 def test_scheduler_rejects_insufficient_paged_eviction_capacity():
     scheduler = object.__new__(Scheduler)
     scheduler.block_size = 4
+    scheduler.max_num_running_reqs = 8
+    scheduler.max_num_scheduled_tokens = 4
     scheduler.kv_cache_manager = make_manager(block_size=4, num_blocks=3)
     scheduler.paged_eviction_config = PagedEvictionConfig(cache_budget_tokens=8)
 
-    with pytest.raises(ValueError, match="one cache budget plus one temporary block"):
+    with pytest.raises(ValueError, match="one cache budget and one maximum"):
         scheduler._initialize_paged_eviction_capacity()
 
 
 def test_scheduler_stops_admitting_at_paged_eviction_capacity():
     scheduler = object.__new__(Scheduler)
     scheduler.block_size = 4
+    scheduler.max_num_running_reqs = 8
+    scheduler.max_num_scheduled_tokens = 2
     scheduler.kv_cache_manager = make_manager(block_size=4, num_blocks=7)
     scheduler.paged_eviction_config = PagedEvictionConfig(cache_budget_tokens=8)
     scheduler._initialize_paged_eviction_capacity()
@@ -219,6 +227,8 @@ def test_scheduler_stops_admitting_at_paged_eviction_capacity():
 def test_concurrency_cap_reserves_partial_block_decode_headroom():
     scheduler = object.__new__(Scheduler)
     scheduler.block_size = 4
+    scheduler.max_num_running_reqs = 8
+    scheduler.max_num_scheduled_tokens = 2
     scheduler.kv_cache_manager = make_manager(block_size=4, num_blocks=7)
     scheduler.paged_eviction_config = PagedEvictionConfig(cache_budget_tokens=8)
     scheduler._initialize_paged_eviction_capacity()
@@ -407,15 +417,82 @@ def test_scheduler_repeated_eviction_preserves_logical_progress_and_order():
     assert request.num_computed_tokens == logical_tokens
 
 
-def test_prompt_must_fit_block_aligned_budget():
+def test_scheduler_evicts_all_full_block_overflow_from_prefill_chunk():
+    manager = make_manager(block_size=2)
+    request = make_request()
+    assert manager.allocate_slots(request, 8, num_required_tokens=8) is not None
+
+    scheduler = object.__new__(Scheduler)
+    scheduler.block_size = 2
+    scheduler.kv_cache_manager = manager
+    scheduler.paged_eviction_config = PagedEvictionConfig(cache_budget_tokens=4)
+    scheduler.paged_eviction_states = {
+        request.request_id: PagedEvictionRequestState(resident_tokens=4)
+    }
+    scheduler.requests = {request.request_id: request}
+
+    block_ids = manager.get_block_ids(request.request_id)[0]
+    scheduler_output = SchedulerOutput.make_empty()
+    scheduler_output.num_scheduled_tokens = {request.request_id: 4}
+    model_runner_output = ModelRunnerOutput(
+        req_ids=[request.request_id],
+        req_id_to_index={request.request_id: 0},
+        paged_eviction_scores={
+            request.request_id: dict(zip(block_ids, [0.0, 3.0, 1.0, 2.0]))
+        },
+    )
+
+    scheduler._update_paged_eviction(scheduler_output, model_runner_output)
+
+    assert manager.get_block_ids(request.request_id)[0] == [block_ids[1], block_ids[3]]
+    assert scheduler.paged_eviction_states[request.request_id].resident_tokens == 4
+
+
+def test_scheduler_does_not_evict_partial_tail_block():
+    manager = make_manager(block_size=4)
+    request = make_request()
+    assert manager.allocate_slots(request, 13, num_required_tokens=13) is not None
+
+    scheduler = object.__new__(Scheduler)
+    scheduler.block_size = 4
+    scheduler.kv_cache_manager = manager
+    scheduler.paged_eviction_config = PagedEvictionConfig(cache_budget_tokens=8)
+    scheduler.paged_eviction_states = {
+        request.request_id: PagedEvictionRequestState(resident_tokens=8)
+    }
+    scheduler.requests = {request.request_id: request}
+
+    block_ids = manager.get_block_ids(request.request_id)[0]
+    scheduler_output = SchedulerOutput.make_empty()
+    scheduler_output.num_scheduled_tokens = {request.request_id: 5}
+    model_runner_output = ModelRunnerOutput(
+        req_ids=[request.request_id],
+        req_id_to_index={request.request_id: 0},
+        paged_eviction_scores={
+            request.request_id: dict(zip(block_ids[:3], [2.0, 0.0, 1.0]))
+        },
+    )
+
+    scheduler._update_paged_eviction(scheduler_output, model_runner_output)
+
+    assert block_ids[3] in manager.get_block_ids(request.request_id)[0]
+    assert scheduler.paged_eviction_states[request.request_id].resident_tokens == 9
+
+
+def test_long_prompt_is_accepted_for_chunked_prefill():
     scheduler = object.__new__(Scheduler)
     scheduler.block_size = 4
     scheduler.paged_eviction_config = PagedEvictionConfig(cache_budget_tokens=4)
     scheduler.paged_eviction_states = {}
     scheduler.requests = {}
+    scheduler.waiting = Mock()
+    scheduler.skipped_waiting = Mock()
+    scheduler.connector = None
+    scheduler.log_stats = False
 
-    with pytest.raises(ValueError, match="prompt requires 8 block-aligned"):
-        scheduler.add_request(make_request())
+    scheduler.add_request(make_request())
+
+    assert scheduler.paged_eviction_states == {"request": PagedEvictionRequestState()}
 
 
 def test_disabled_state_is_safe_for_partially_constructed_scheduler():
@@ -424,7 +501,7 @@ def test_disabled_state_is_safe_for_partially_constructed_scheduler():
     assert not scheduler.paged_eviction_enabled
 
 
-def test_preemption_rejects_logical_sequence_larger_than_budget():
+def test_preemption_resets_compressed_request_for_recomputation():
     scheduler = object.__new__(Scheduler)
     scheduler.block_size = 4
     scheduler.paged_eviction_config = PagedEvictionConfig(cache_budget_tokens=8)
@@ -434,12 +511,18 @@ def test_preemption_rejects_logical_sequence_larger_than_budget():
     scheduler.kv_cache_manager = Mock()
     scheduler.encoder_cache_manager = Mock()
     scheduler._inflight_prefills = set()
+    scheduler.waiting = Mock()
+    scheduler.log_stats = False
 
     request = make_request()
     request.append_output_token_ids(1)
     request.status = RequestStatus.RUNNING
 
-    with pytest.raises(RuntimeError, match="Prefill compression is not supported"):
-        scheduler._preempt_request(request, 0.0)
+    scheduler._preempt_request(request, 0.0)
 
-    scheduler.kv_cache_manager.free.assert_not_called()
+    scheduler.kv_cache_manager.free.assert_called_once_with(request)
+    assert request.num_computed_tokens == 0
+    assert scheduler.paged_eviction_states[request.request_id] == (
+        PagedEvictionRequestState()
+    )
+    scheduler.waiting.prepend_request.assert_called_once_with(request)

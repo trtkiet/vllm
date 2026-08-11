@@ -136,13 +136,15 @@ class PagedEvictionWorkerState:
         for req_id, num_tokens in num_scheduled_tokens.items():
             resident_tokens = self.resident_tokens[req_id] + num_tokens
             self.resident_tokens[req_id] = resident_tokens
-            if (
-                resident_tokens <= self.config.cache_budget_tokens
-                or resident_tokens % self.block_size != 0
-            ):
+            num_full_blocks = resident_tokens // self.block_size
+            budget_blocks = self.config.cache_budget_tokens // self.block_size
+            if num_full_blocks <= budget_blocks:
                 continue
 
-            block_ids = request_block_ids[req_id]
+            # The final block can be partial during chunked prefill. It is not
+            # eligible for eviction until every token in that block has been
+            # written and can be scored safely.
+            block_ids = request_block_ids[req_id][:num_full_blocks]
             requests_to_score[req_id] = block_ids
             for block_id in block_ids:
                 if block_id not in self.block_scores and block_id not in missing_seen:

@@ -905,8 +905,6 @@ class VllmConfig:
 
         if self.scheduler_config.async_scheduling:
             raise ValueError("PagedEviction requires synchronous scheduling.")
-        if self.scheduler_config.enable_chunked_prefill:
-            raise ValueError("PagedEviction does not support chunked prefill.")
         if self.scheduler_config.scheduler_cls is not None:
             raise ValueError("PagedEviction requires the default scheduler.")
         if self.speculative_config is not None:
@@ -915,7 +913,19 @@ class VllmConfig:
             raise ValueError("PagedEviction does not support diffusion models.")
         cache_dtype = self.cache_config.cache_dtype
         if cache_dtype == "auto":
-            cache_dtype = str(self.model_config.dtype).removeprefix("torch.")
+            cache_dtype = self.cache_config.cache_dtype
+            if cache_dtype == "auto":
+                supported_cache_dtype = self.model_config.dtype in (
+                    torch.float16,
+                    torch.bfloat16,
+                )
+            else:
+                supported_cache_dtype = cache_dtype in ("float16", "bfloat16")
+
+            if not supported_cache_dtype:
+                raise ValueError(
+                    "PagedEviction requires an unquantized float16 or bfloat16 KV cache."
+                )
         if cache_dtype not in ("float16", "bfloat16"):
             raise ValueError(
                 "PagedEviction requires an unquantized float16 or bfloat16 KV cache."
