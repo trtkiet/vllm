@@ -51,6 +51,7 @@ from vllm.config import (
     MultiModalConfig,
     ObservabilityConfig,
     OffloadConfig,
+    PagedEvictionConfig,
     ParallelConfig,
     PoolerConfig,
     PrefetchOffloadConfig,
@@ -613,6 +614,7 @@ class EngineArgs:
     reasoning_parser_plugin: str | None = None
 
     speculative_config: dict[str, Any] | None = None
+    paged_eviction_config: dict[str, Any] | PagedEvictionConfig | None = None
     spec_method: str | None = None
     spec_model: str | None = None
     spec_tokens: int | None = None
@@ -1468,6 +1470,11 @@ class EngineArgs:
         vllm_group.add_argument(
             "--speculative-config", "-sc", **vllm_kwargs["speculative_config"]
         )
+        vllm_kwargs["paged_eviction_config"]["type"] = optional_type(json.loads)
+        vllm_group.add_argument(
+            "--paged-eviction-config",
+            **vllm_kwargs["paged_eviction_config"],
+        )
         speculative_kwargs = get_kwargs(SpeculativeConfig)
         vllm_group.add_argument("--spec-method", **speculative_kwargs["method"])
         vllm_group.add_argument("--spec-model", **speculative_kwargs["model"])
@@ -2253,6 +2260,13 @@ class EngineArgs:
             kernel_config=kernel_config,
             lora_config=lora_config,
             speculative_config=speculative_config,
+            paged_eviction_config=(
+                self.paged_eviction_config
+                if isinstance(self.paged_eviction_config, PagedEvictionConfig)
+                else PagedEvictionConfig(**self.paged_eviction_config)
+                if self.paged_eviction_config is not None
+                else None
+            ),
             diffusion_config=diffusion_config,
             structured_outputs_config=self.structured_outputs_config,
             observability_config=observability_config,

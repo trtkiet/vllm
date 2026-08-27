@@ -123,8 +123,8 @@ class Sampler:
         # (seq_len < prefill_len) which aren't done prefilling and produce no
         # output token. num_rejected is always 0 here (one logit per request).
         num_sampled, num_rejected = get_num_sampled_and_rejected(
-            input_batch.seq_lens.new_ones(input_batch.num_reqs),
-            input_batch.seq_lens,
+            input_batch.logical_seq_lens.new_ones(input_batch.num_reqs),
+            input_batch.logical_seq_lens,
             input_batch.cu_num_logits,
             input_batch.idx_mapping,
             self.req_states.prefill_len.gpu,

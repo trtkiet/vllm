@@ -254,6 +254,7 @@ class KVCacheManager:
         full_sequence_must_fit: bool = False,
         reserved_blocks: int = 0,
         has_scheduled_reqs: bool = True,
+        num_required_tokens: int | None = None,
     ) -> KVCacheBlocks | None:
         """Add slots for a request with new tokens to append.
 
@@ -286,6 +287,9 @@ class KVCacheManager:
                 blocks an already in-flight (prefilling) sequence is relying on.
             has_scheduled_reqs: Whether any requests are already scheduled to run
                 this step, controls whether watermark is applied.
+            num_required_tokens: Total resident token slots required after this
+                allocation. When unset, capacity is derived from logical sequence
+                progress.
 
         Blocks layout:
         ```
@@ -387,9 +391,17 @@ class KVCacheManager:
                 return None
 
         num_tokens_main_model = total_computed_tokens + num_new_tokens
-        num_tokens_need_slot = min(
-            num_tokens_main_model + num_lookahead_tokens, self.max_model_len
-        )
+        if num_required_tokens is None:
+            num_tokens_need_slot = num_tokens_main_model + num_lookahead_tokens
+            num_tokens_main_model_for_allocation = num_tokens_main_model
+        else:
+            if num_required_tokens < num_new_tokens:
+                raise ValueError(
+                    "num_required_tokens must include all newly scheduled tokens"
+                )
+            num_tokens_need_slot = num_required_tokens + num_lookahead_tokens
+            num_tokens_main_model_for_allocation = num_required_tokens
+        num_tokens_need_slot = min(num_tokens_need_slot, self.max_model_len)
 
         # Free the blocks that are skipped during the attention computation
         # (e.g., tokens outside the sliding window).
@@ -408,7 +420,7 @@ class KVCacheManager:
             num_encoder_tokens=num_encoder_tokens,
             total_computed_tokens=num_local_computed_tokens
             + num_external_computed_tokens,
-            num_tokens_main_model=num_tokens_main_model,
+            num_tokens_main_model=num_tokens_main_model_for_allocation,
         )
 
         # Keep `reserved_blocks` free for other in-flight sequences, and an
@@ -435,7 +447,7 @@ class KVCacheManager:
         new_blocks = self.coordinator.allocate_new_blocks(
             request.request_id,
             num_tokens_need_slot,
-            num_tokens_main_model,
+            num_tokens_main_model_for_allocation,
             num_encoder_tokens,
         )
 
@@ -479,6 +491,10 @@ class KVCacheManager:
                 local computed tokens and external computed tokens.
         """
         self.coordinator.remove_skipped_blocks(request_id, total_computed_tokens)
+
+    def remove_active_block(self, request_id: str, block_id: int) -> None:
+        """Remove an exclusively owned block from an active request."""
+        self.coordinator.remove_active_block(request_id, block_id)
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.

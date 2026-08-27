@@ -205,6 +205,10 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunnerMixin
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
+from vllm.v1.worker.paged_eviction import (
+    PagedEvictionWorkerState,
+    validate_paged_eviction_attention_groups,
+)
 from vllm.v1.worker.ubatch_utils import (
     UBatchSlices,
     check_ubatch_thresholds,
@@ -434,6 +438,10 @@ class GPUModelRunner(
         self.scheduler_config = vllm_config.scheduler_config
         self.speculative_config = vllm_config.speculative_config
         self.observability_config = vllm_config.observability_config
+        self.paged_eviction = PagedEvictionWorkerState(
+            vllm_config.paged_eviction_config,
+            vllm_config.cache_config.block_size,
+        )
 
         model_config = self.model_config
         cache_config = self.cache_config
@@ -721,6 +729,9 @@ class GPUModelRunner(
         self.positions = torch.zeros(
             self.max_num_tokens, dtype=torch.int64, device=self.device
         )
+        self.kv_positions = torch.zeros(
+            self.max_num_tokens, dtype=torch.int64, device=self.device
+        )
         self.query_start_loc = self._make_buffer(
             self.max_num_reqs + 1, dtype=torch.int32
         )
@@ -729,6 +740,12 @@ class GPUModelRunner(
         )
         self.optimistic_seq_lens_cpu = torch.zeros(
             self.max_num_reqs, dtype=torch.int32, pin_memory=self.pin_memory
+        )
+        self.resident_seq_lens_cpu = torch.zeros(
+            self.max_num_reqs, dtype=torch.int32, pin_memory=self.pin_memory
+        )
+        self.num_resident_tokens = self._make_buffer(
+            self.max_num_reqs, dtype=torch.int32
         )
         self.num_computed_tokens = torch.zeros(
             self.max_num_reqs, dtype=torch.int32, device=self.device
@@ -1134,6 +1151,24 @@ class GPUModelRunner(
         The SamplingMetadata is updated and copied to the GPU if there is a
         new/resumed/paused/finished request in the batch.
         """
+        finished_or_preempted_req_ids = set(scheduler_output.finished_req_ids)
+        if scheduler_output.preempted_req_ids:
+            finished_or_preempted_req_ids.update(scheduler_output.preempted_req_ids)
+        self.paged_eviction.update_from_scheduler(
+            scheduler_output.paged_eviction_num_resident_tokens,
+            finished_or_preempted_req_ids,
+        )
+        replacement_block_tables = scheduler_output.paged_eviction_block_tables or {}
+        for new_req_data in scheduler_output.scheduled_new_reqs:
+            self.paged_eviction.invalidate_blocks(
+                block_id for group in new_req_data.block_ids for block_id in group
+            )
+        for new_block_ids in scheduler_output.scheduled_cached_reqs.new_block_ids:
+            if new_block_ids is not None:
+                self.paged_eviction.invalidate_blocks(
+                    block_id for group in new_block_ids for block_id in group
+                )
+
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
@@ -1368,7 +1403,12 @@ class GPUModelRunner(
                     self.input_batch.num_tokens_no_spec[req_index] = end_idx
 
             # Update the block IDs.
-            if not resumed_from_preemption:
+            replacement_block_ids = replacement_block_tables.get(req_id)
+            if replacement_block_ids is not None:
+                req_state.block_ids = tuple(
+                    list(block_ids) for block_ids in replacement_block_ids
+                )
+            elif not resumed_from_preemption:
                 if new_block_ids is not None:
                     # Append the new blocks to the existing block IDs.
                     for block_ids, new_ids in zip(req_state.block_ids, new_block_ids):
@@ -1399,7 +1439,9 @@ class GPUModelRunner(
 
             # Update the persistent batch.
             self.input_batch.num_computed_tokens_cpu[req_index] = num_computed_tokens
-            if new_block_ids is not None:
+            if replacement_block_ids is not None:
+                self.input_batch.block_table.add_row(replacement_block_ids, req_index)
+            elif new_block_ids is not None:
                 self.input_batch.block_table.append_row(new_block_ids, req_index)
 
             # For the last rank, we don't need to update the token_ids_cpu
@@ -2013,6 +2055,21 @@ class GPUModelRunner(
             out=self.optimistic_seq_lens_cpu[:num_reqs],
         )
         self.optimistic_seq_lens_cpu[num_reqs:].fill_(0)
+        if self.paged_eviction.enabled:
+            self.num_resident_tokens.np[:num_reqs] = [
+                self.paged_eviction.resident_tokens[req_id]
+                for req_id in self.input_batch.req_ids
+            ]
+            self.num_resident_tokens.np[num_reqs:].fill(0)
+            self.num_resident_tokens.copy_to_gpu(num_reqs)
+            torch.add(
+                self.num_resident_tokens.cpu[:num_reqs],
+                torch.from_numpy(num_scheduled_tokens),
+                out=self.resident_seq_lens_cpu[:num_reqs],
+            )
+            self.resident_seq_lens_cpu[num_reqs:].fill_(0)
+        else:
+            self.resident_seq_lens_cpu.copy_(self.optimistic_seq_lens_cpu)
 
         # Build prev_positions mapping: current pos -> prev pos (-1 if new).
         # Used for gathering from previous iteration's GPU tensors.
@@ -2106,15 +2163,27 @@ class GPUModelRunner(
             self.num_computed_tokens[req_indices_gpu].to(torch.int64)
             + self.query_pos.gpu[:total_num_scheduled_tokens]
         )
-        self.seq_lens[:num_reqs] = (
-            self.num_computed_tokens[:num_reqs] + num_scheduled_tokens_gpu
-        )
+        if self.paged_eviction.enabled:
+            self.kv_positions[:total_num_scheduled_tokens] = (
+                self.num_resident_tokens.gpu[req_indices_gpu].to(torch.int64)
+                + self.query_pos.gpu[:total_num_scheduled_tokens]
+            )
+            self.seq_lens[:num_reqs] = (
+                self.num_resident_tokens.gpu[:num_reqs] + num_scheduled_tokens_gpu
+            )
+        else:
+            self.kv_positions[:total_num_scheduled_tokens].copy_(
+                self.positions[:total_num_scheduled_tokens]
+            )
+            self.seq_lens[:num_reqs] = (
+                self.num_computed_tokens[:num_reqs] + num_scheduled_tokens_gpu
+            )
         self.seq_lens[num_reqs:].fill_(0)
 
         self.input_batch.block_table.compute_slot_mapping(
             num_reqs,
             self.query_start_loc.gpu[: num_reqs + 1],
-            self.positions[:total_num_scheduled_tokens],
+            self.kv_positions[:total_num_scheduled_tokens],
         )
 
         # Copy the tensors to the GPU.
@@ -2238,7 +2307,7 @@ class GPUModelRunner(
             # window size when capturing to make sure the correct kernel is selected.
             max_seq_len = self.max_model_len
         else:
-            max_seq_len = self.optimistic_seq_lens_cpu.numpy()[:num_reqs].max().item()
+            max_seq_len = self.resident_seq_lens_cpu.numpy()[:num_reqs].max().item()
 
         kv_cache_groups = self.kv_cache_config.kv_cache_groups
 
@@ -2277,19 +2346,24 @@ class GPUModelRunner(
                 slot_mapping_attn[:num_tokens]
             )
 
-        num_computed_tokens_cpu = self.input_batch.num_computed_tokens_cpu_tensor[
-            :num_reqs_padded
-        ]
+        logical_num_computed_tokens_cpu = (
+            self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs_padded]
+        )
+        num_computed_tokens_cpu = (
+            self.num_resident_tokens.cpu[:num_reqs_padded]
+            if self.paged_eviction.enabled
+            else logical_num_computed_tokens_cpu
+        )
         num_prompt_tokens_cpu = self.input_batch.num_prompt_tokens_cpu_tensor[
             :num_reqs_padded
         ]
-        seq_lens_cpu = self.optimistic_seq_lens_cpu[:num_reqs_padded]
+        seq_lens_cpu = self.resident_seq_lens_cpu[:num_reqs_padded]
         seq_lens_cpu_upper_bound = seq_lens_cpu
 
         # is_prefilling: True if request is still in prefill phase.
         # Used by mamba backends to distinguish actual decodes from
         # short extends.
-        is_prefilling = num_computed_tokens_cpu < num_prompt_tokens_cpu
+        is_prefilling = logical_num_computed_tokens_cpu < num_prompt_tokens_cpu
         # Zero out padded rows so stale data from condense() doesn't
         # misclassify padding as prefill in CUDA graph mode.
         is_prefilling[num_reqs:] = False
@@ -4602,6 +4676,15 @@ class GPUModelRunner(
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
 
+        paged_eviction_scores = self.paged_eviction.score_requests(
+            self.kv_caches,
+            {
+                req_id: self.requests[req_id].block_ids[0]
+                for req_id in scheduler_output.num_scheduled_tokens
+            },
+            scheduler_output.num_scheduled_tokens,
+        )
+
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             output = ModelRunnerOutput(
                 req_ids=req_ids_output_copy,
@@ -4614,6 +4697,7 @@ class GPUModelRunner(
                 if self.supports_mm_inputs
                 else None,
                 num_nans_in_logits=num_nans_in_logits,
+                paged_eviction_scores=paged_eviction_scores,
                 cudagraph_stats=cudagraph_stats,
                 routed_experts=None,
             )
@@ -7313,6 +7397,14 @@ class GPUModelRunner(
         self.may_add_encoder_only_layers_to_kv_cache_config()
         self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
         self.initialize_attn_backend(kv_cache_config, is_profiling=is_profiling)
+        validate_paged_eviction_attention_groups(
+            self.vllm_config.paged_eviction_config,
+            self.attn_groups,
+        )
+        if self.paged_eviction.enabled:
+            self.paged_eviction.set_block_size(
+                kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size
+            )
         initialize_mamba_ssu_backend(
             self.vllm_config.mamba_config, self.kv_cache_config
         )

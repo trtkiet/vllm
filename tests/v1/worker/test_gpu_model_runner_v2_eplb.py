@@ -10,6 +10,7 @@ import torch
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
 from vllm.v1.worker.gpu import eplb_utils as eplb
 from vllm.v1.worker.gpu import model_runner as mrv2
+from vllm.v1.worker.paged_eviction import PagedEvictionWorkerState
 
 
 class FakeMemoryProfiler:
@@ -202,3 +203,54 @@ def test_v2_sample_tokens_runs_eplb_on_non_last_pp_rank(monkeypatch):
     output = mrv2.GPUModelRunner.sample_tokens(runner, None)
     assert output in (EMPTY_MODEL_RUNNER_OUTPUT, None)
     assert events == ["receive", "postprocess_num_computed_tokens", "eplb"]
+
+
+def test_v2_sample_tokens_skips_paged_eviction_blocks_when_disabled(monkeypatch):
+    runner = _make_runner(num_speculative_steps=0)
+    runner.paged_eviction = PagedEvictionWorkerState(None, block_size=16)
+    runner.kv_caches = []
+    runner.pp_handler = None
+    runner.model = SimpleNamespace(compute_logits=lambda *_: None)
+    runner.prompt_logprobs_worker = SimpleNamespace(
+        compute_prompt_logprobs=lambda *_, **__: {}
+    )
+    runner.req_states = SimpleNamespace(
+        all_token_ids=SimpleNamespace(gpu=torch.empty(1, 1, dtype=torch.int32)),
+        num_computed_tokens=SimpleNamespace(gpu=torch.empty(1, dtype=torch.int32)),
+        prompt_len=SimpleNamespace(np=[1]),
+    )
+    runner.main_stream = None
+    runner.output_copy_stream = None
+    runner.postprocess_sampled = lambda *_, **__: None
+
+    input_batch = SimpleNamespace(
+        req_ids=["_warmup_0_"],
+        num_scheduled_tokens=torch.tensor([1]),
+        idx_mapping=torch.tensor([0], dtype=torch.int32),
+        query_start_loc=None,
+    )
+    runner.execute_model_state = SimpleNamespace(
+        input_batch=input_batch,
+        attn_metadata=None,
+        slot_mappings_by_layer=None,
+        hidden_states=torch.zeros(1, 1),
+        aux_hidden_states=None,
+        finished_req_ids=set(),
+    )
+    sampler_output = SimpleNamespace(
+        sampled_token_ids=torch.zeros((1, 1), dtype=torch.int64),
+    )
+    runner.sample = lambda *_, **__: (
+        sampler_output,
+        torch.tensor([1]),
+        torch.tensor([0]),
+    )
+    monkeypatch.setattr(
+        mrv2,
+        "AsyncOutput",
+        lambda **kwargs: kwargs["model_runner_output"],
+    )
+
+    output = mrv2.GPUModelRunner.sample_tokens(runner, None)
+
+    assert output.paged_eviction_scores is None

@@ -240,6 +240,12 @@ class SchedulerOutput:
     # preventing stale NaN/data from corrupting attention or SSM computation.
     new_block_ids_to_zero: list[int] | None = None
 
+    # PagedEviction state for requests scheduled in this step.
+    # Resident token counts describe the KV context before the current query.
+    paged_eviction_num_resident_tokens: dict[str, int] | None = None
+    # Full replacement block-table rows for previously cached requests.
+    paged_eviction_block_tables: dict[str, tuple[list[int], ...]] | None = None
+
     # Dynamic speculative decoding: optimal K chosen by scheduler.
     # Number of spec tokens to schedule for the next step.
     num_spec_tokens_to_schedule: int = 0

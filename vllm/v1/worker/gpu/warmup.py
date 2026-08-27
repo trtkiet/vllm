@@ -95,6 +95,10 @@ def warmup_kernels(
     prefill_output.num_scheduled_tokens = {rid: prompt_len for rid in req_ids}
     prefill_output.total_num_scheduled_tokens = prompt_len * num_reqs
     prefill_output.num_common_prefix_blocks = [0] * num_kv_cache_groups
+    if model_runner.paged_eviction.enabled:
+        prefill_output.paged_eviction_num_resident_tokens = {
+            req_id: 0 for req_id in req_ids
+        }
 
     # Disable KV connector for warmup run.
     model_runner.kv_connector.set_disabled(True)
@@ -142,6 +146,10 @@ def warmup_kernels(
             decode_output.num_scheduled_tokens.values()
         )
         decode_output.num_common_prefix_blocks = [0] * num_kv_cache_groups
+        if model_runner.paged_eviction.enabled:
+            decode_output.paged_eviction_num_resident_tokens = {
+                req_id: prompt_len for req_id in req_ids
+            }
 
         worker_execute_model(decode_output)
         worker_sample_tokens(None)

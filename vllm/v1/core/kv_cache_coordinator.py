@@ -303,6 +303,13 @@ class KVCacheCoordinator(ABC):
         for manager in self.single_type_managers:
             manager.remove_skipped_blocks(request_id, total_computed_tokens)
 
+    def remove_active_block(self, request_id: str, block_id: int) -> None:
+        if len(self.single_type_managers) != 1:
+            raise ValueError(
+                "Active KV block removal requires exactly one KV cache group."
+            )
+        self.single_type_managers[0].remove_active_block(request_id, block_id)
+
     def get_blocks(self, request_id: str) -> tuple[list[KVCacheBlock], ...]:
         """
         Get the blocks for the request.
