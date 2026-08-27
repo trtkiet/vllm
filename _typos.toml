@@ -1,0 +1,5 @@
+# Config for the `typos` pre-commit hook (https://github.com/crate-ci/typos).
+[default.extend-words]
+# RULER task: Frequency of Words.
+fwe = "fwe"
+FWE = "FWE"
