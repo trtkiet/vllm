@@ -228,6 +228,9 @@ hip_compat.h
 # Benchmark dataset
 benchmarks/**/*.json
 
+# PagedEviction benchmark artifacts (logs, CSV tables, plots)
+benchmarks/results/
+
 # Linting
 actionlint
 shellcheck*/
