@@ -1476,6 +1476,12 @@ def validate_artifacts(
     server_log_path = Path(artifacts.server_log)
     if server_log_path.exists():
         server_log = server_log_path.read_text(encoding="utf-8", errors="replace")
+        # Errors logged while the server is being force-terminated are shutdown
+        # artifacts (e.g. EngineDeadError from the output handler), not serving
+        # failures, so only scan the log up to the first shutdown marker.
+        shutdown_index = server_log.find("[shutdown]")
+        if shutdown_index != -1:
+            server_log = server_log[:shutdown_index]
         match = SERVER_ERROR_RE.search(server_log)
         if match is not None:
             errors.append(f"server log contains error marker: {match.group(0)!r}")

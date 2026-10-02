@@ -35,6 +35,7 @@ import argparse
 import csv
 import json
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -497,12 +498,19 @@ def run_ruler_cell(
         },
     )
 
+    resume_from_checkpoint = args.resume and (run_dir / "ruler_checkpoints").exists()
+    if resume_from_checkpoint:
+        print(f"Resuming incomplete cell {run_dir}")
+    skip_serving = args.skip_serving_benchmark or (
+        resume_from_checkpoint and (run_dir / "bench.json").exists()
+    )
+
     if args.dry_run:
         cell_desc = f"{runner}/{label}/context_{context_length}"
         runner_env = bench.RUNNER_ENV[runner]
         print(f"\n[{cell_desc}] VLLM_USE_V2_MODEL_RUNNER={runner_env} server:")
         print(shlex.join(server_command))
-        if args.skip_serving_benchmark:
+        if skip_serving:
             print(f"[{cell_desc}] benchmark: skipped")
         else:
             print(f"[{cell_desc}] benchmark:")
@@ -600,7 +608,7 @@ def run_ruler_cell(
                 bench.sleep_with_progress(args.post_load_sleep_s, detail)
             bench.advance_run_phase_progress(phase_progress)
 
-            if not args.skip_serving_benchmark:
+            if not skip_serving:
                 phase.set("benchmark")
                 bench.set_run_phase_progress(phase_progress, "benchmark")
                 with bench.detail_progress(
@@ -626,7 +634,10 @@ def run_ruler_cell(
                 ) as detail:
                     try:
                         ruler_result = evaluate_ruler(
-                            args, context_length, progress=detail
+                            args,
+                            context_length,
+                            progress=detail,
+                            checkpoint_dir=run_dir / "ruler_checkpoints",
                         )
                     except Exception as exc:
                         ruler_result = {"error": f"{type(exc).__name__}: {exc}"}
@@ -660,6 +671,12 @@ def run_ruler_cell(
         if phase_progress is not None:
             phase_progress.close()
 
+    # A finished cell no longer needs its per-sample checkpoints.
+    if not args.skip_ruler and not args.dry_run:
+        ruler = bench.load_json(run_dir / "ruler.json")
+        if bench.as_float(ruler.get("score_percent")) is not None:
+            shutil.rmtree(run_dir / "ruler_checkpoints", ignore_errors=True)
+
     return CellRun(
         budget=budget,
         context_length=context_length,
@@ -680,6 +697,29 @@ def cell_artifacts_complete(args: argparse.Namespace, run_dir: Path) -> bool:
     return bench.as_float(ruler.get("score_percent")) is not None
 
 
+def load_task_checkpoint(path: Path, sample_count: int) -> list[dict[str, Any]]:
+    """Load completed samples for one task, discarding any partial write."""
+    samples: list[dict[str, Any]] = []
+    if not path.exists():
+        return samples
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            sample = json.loads(line)
+        except json.JSONDecodeError:
+            break
+        samples.append(sample)
+    return samples[:sample_count]
+
+
+def append_task_checkpoint(path: Path, sample: dict[str, Any]) -> None:
+    """Append one completed RULER sample so a long run can resume mid-task."""
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(sample, ensure_ascii=False) + "\n")
+
+
 def score_sample(prediction: str | None, references: list[str], task: str) -> float:
     """Score one sample with the official substring match.
 
@@ -698,17 +738,32 @@ def evaluate_ruler(
     args: argparse.Namespace,
     context_length: int,
     progress: tqdm | None = None,
+    checkpoint_dir: Path | None = None,
 ) -> dict[str, Any]:
     from datasets import load_dataset
 
     dataset_name = args.ruler_dataset_template.format(context_length=context_length)
     tasks_result: dict[str, Any] = {}
     num_samples = 0
+    if checkpoint_dir is not None:
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
     for task in args.ruler_tasks:
         split = load_dataset(dataset_name, split=task)
         sample_count = min(args.ruler_samples_per_task, len(split))
         samples: list[dict[str, Any]] = []
-        for sample_number in range(sample_count):
+        checkpoint_path = (
+            checkpoint_dir / f"{context_length}_{task}.jsonl"
+            if checkpoint_dir is not None
+            else None
+        )
+        if checkpoint_path is not None and checkpoint_path.exists():
+            samples = load_task_checkpoint(checkpoint_path, sample_count)
+        if samples:
+            bench.set_detail_postfix(
+                progress, ruler=task, sample=len(samples), resumed=True
+            )
+            bench.advance_progress(progress, len(samples))
+        for sample_number in range(len(samples), sample_count):
             row = split[sample_number]
             prompt = row["input"] + (row.get("answer_prefix") or "")
             references = [str(reference) for reference in row["outputs"]]
@@ -741,6 +796,8 @@ def evaluate_ruler(
             finally:
                 sample["elapsed_s"] = time.perf_counter() - started
             samples.append(sample)
+            if checkpoint_path is not None:
+                append_task_checkpoint(checkpoint_path, sample)
             bench.set_detail_postfix(progress, ruler=task, sample=len(samples))
             bench.advance_progress(progress)
         task_accuracy = (
